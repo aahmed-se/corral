@@ -423,8 +423,8 @@ function FaviconLine({ corral }: { corral: Corral }) {
   }
   const idleLabel = favicons && favicons.message
     ? favicons.message
-    : faviconCount > 0
-      ? `Refresh site icons · ${faviconCount.toLocaleString()} cached`
+    : faviconCount > 0 || Boolean(favicons?.failed)
+      ? `Update site icons · ${faviconCount.toLocaleString()} cached${favicons?.failed ? ` · ${favicons.failed.toLocaleString()} unavailable` : ''}`
       : 'Build site icon cache';
   return (
     <button

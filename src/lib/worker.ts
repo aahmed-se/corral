@@ -28,6 +28,13 @@ import {
   type ViewOptions,
 } from './db.ts';
 import { parseBookmarkJson, parseNetscapeHtml, toNetscapeHtmlParts, type RawBookmarkInput } from './import-export.ts';
+import {
+  chromeFaviconPageUrlCandidates,
+  chromeFaviconUrl,
+  faviconNeedsFetch,
+  previewFaviconUrl,
+  type FaviconSource,
+} from './favicon-cache.ts';
 import { ShardBuilder, ShardStore, type ShardData } from './search-engine.ts';
 import { deserializeViewData, serializeViewData, ViewIndex, ViewIndexBuilder } from './view-index.ts';
 import { yieldToQueue } from './task-queue.ts';
@@ -66,8 +73,6 @@ export type WorkerOp =
   | { kind: 'view-total'; options: ViewOptions };
 
 export type IndexPhase = 'scanning' | 'analyzing' | 'saving';
-
-export type FaviconSource = { mode: 'chrome' | 's2'; prefix: string };
 
 export type WorkerRequest =
   | { type: 'init' }
@@ -671,36 +676,72 @@ function jsonParts(recordParts: string[]) {
 // favicons store. Bumping `faviconRun` cancels the active pass at its next
 // checkpoint; `fetchedAt` makes an interrupted pass resumable.
 
-const FAVICON_FRESH_MS = 30 * 24 * 3_600_000;
-const FAVICON_CONCURRENCY = 12;
+const FAVICON_CONCURRENCY = 8;
 const FAVICON_TIMEOUT_MS = 8_000;
+const FAVICON_MAX_BYTES = 1_048_576;
 
 let faviconRun = 0;
 
-function faviconUrl(source: { mode: 'chrome' | 's2'; prefix: string }, host: string) {
-  // chrome: the extension's _favicon endpoint (icons Chrome already has).
-  // s2: a same-origin proxy to Google's favicon service, for the dev preview.
-  return source.mode === 'chrome'
-    ? `${source.prefix}?pageUrl=${encodeURIComponent(`https://${host}/`)}&size=32`
-    : `${source.prefix}${encodeURIComponent(host)}`;
-}
-
-async function fetchFavicon(source: { mode: 'chrome' | 's2'; prefix: string }, host: string): Promise<FaviconRow> {
-  try {
-    // no-store: the blob lands in IndexedDB, so the HTTP cache would only
-    // double-store it — and a cached 301 from the service would otherwise
-    // short-circuit future fetches to a cross-origin hop that dies on CORS.
-    const response = await fetch(faviconUrl(source, host), { signal: AbortSignal.timeout(FAVICON_TIMEOUT_MS), cache: 'no-store' });
-    if (!response.ok) return { host, bytes: null, status: 'missing', fetchedAt: Date.now() };
-    const bytes = await response.blob();
-    if (bytes.size === 0) return { host, bytes: null, status: 'missing', fetchedAt: Date.now() };
-    return { host, bytes, status: 'ok', fetchedAt: Date.now() };
-  } catch {
-    return { host, bytes: null, status: 'error', fetchedAt: Date.now() };
+async function decodeFavicon(response: Response) {
+  const contentType = (response.headers.get('content-type') ?? '').toLowerCase();
+  if (!response.ok || !contentType.startsWith('image/')) return null;
+  const bytes = await response.blob();
+  if (bytes.size === 0 || bytes.size > FAVICON_MAX_BYTES) return null;
+  if (typeof createImageBitmap === 'function') {
+    try {
+      const bitmap = await createImageBitmap(bytes);
+      bitmap.close();
+    } catch {
+      return null;
+    }
   }
+  return bytes;
 }
 
-async function buildFavicons(source: { mode: 'chrome' | 's2'; prefix: string }) {
+async function fetchFavicon(source: FaviconSource, host: string, samples: string[]): Promise<FaviconRow> {
+  const requestUrls = source.mode === 'chrome'
+    ? chromeFaviconPageUrlCandidates(host, samples).map((pageUrl) => chromeFaviconUrl(source.prefix, pageUrl))
+    : [previewFaviconUrl(source.prefix, host)];
+  let hadError = false;
+  for (const requestUrl of requestUrls) {
+    try {
+      // Accepted bytes live in IndexedDB. Failed responses must not poison
+      // alternate candidates or the user's next retry.
+      const response = await fetch(requestUrl, { signal: AbortSignal.timeout(FAVICON_TIMEOUT_MS), cache: 'no-store' });
+      const bytes = await decodeFavicon(response);
+      if (bytes) return { host, bytes, status: 'ok', fetchedAt: Date.now() };
+      if (response.status >= 500) hadError = true;
+    } catch {
+      hadError = true;
+    }
+  }
+  return { host, bytes: null, status: hadError ? 'error' : 'missing', fetchedAt: Date.now() };
+}
+
+/** Up to two real bookmark URLs per requested host. The URLs remain inside
+ * the extension and are queried only through Chrome's local favicon API. */
+async function faviconSamples(hosts: string[], run: number) {
+  if (hosts.length === 0) return new Map<string, string[]>();
+  const wanted = new Set(hosts);
+  const samples = new Map<string, string[]>();
+  let lastId = 0;
+  for (;;) {
+    const records = await db.bookmarks.where('id').above(lastId).limit(SCAN_CHUNK).toArray();
+    if (records.length === 0) break;
+    lastId = records.at(-1)?.id ?? lastId;
+    for (const record of records) {
+      if (!wanted.has(record.host)) continue;
+      const list = samples.get(record.host) ?? [];
+      if (!list.includes(record.url) && list.length < 2) list.push(record.url);
+      samples.set(record.host, list);
+    }
+    if (run !== faviconRun) return null;
+    await yieldToQueue();
+  }
+  return samples;
+}
+
+async function buildFavicons(source: FaviconSource) {
   const run = ++faviconRun;
   const views = servingViews;
   if (!views) {
@@ -708,23 +749,28 @@ async function buildFavicons(source: { mode: 'chrome' | 's2'; prefix: string }) 
     return;
   }
 
-  // Most-bookmarked hosts first, skipping fresh cache rows and pseudo-hosts
-  // (getBaseHost maps non-http protocols to dotless labels).
+  // Most-bookmarked hosts first. Explicit refreshes always retry failures;
+  // successful icons keep their monthly freshness window.
   const now = Date.now();
-  const ranked = views.hosts().filter((entry) => entry.host.includes('.')).map((entry) => entry.host);
+  const ranked = views.hosts().filter((entry) => source.mode === 'chrome' || entry.host.includes('.')).map((entry) => entry.host);
   const pending: string[] = [];
   for (let offset = 0; offset < ranked.length; offset += INSERT_CHUNK) {
     const slice = ranked.slice(offset, offset + INSERT_CHUNK);
     const rows = await db.favicons.bulkGet(slice);
     for (let index = 0; index < slice.length; index += 1) {
       const row = rows[index];
-      if (!row || now - row.fetchedAt > FAVICON_FRESH_MS) pending.push(slice[index]!);
+      if (faviconNeedsFetch(row, now, source.retryFailures)) pending.push(slice[index]!);
     }
     if (run !== faviconRun) return;
     await yieldToQueue();
   }
 
-  const total = pending.length;
+  const samples = source.mode === 'chrome' ? await faviconSamples(pending, run) : new Map<string, string[]>();
+  if (!samples || run !== faviconRun) return;
+  const fetchable = source.mode === 'chrome'
+    ? pending.filter((host) => chromeFaviconPageUrlCandidates(host, samples.get(host) ?? []).length > 0)
+    : pending;
+  const total = fetchable.length;
   let done = 0;
   let ok = 0;
   let failed = 0;
@@ -735,12 +781,12 @@ async function buildFavicons(source: { mode: 'chrome' | 's2'; prefix: string }) 
   };
   report(total > 0);
 
-  for (let offset = 0; offset < pending.length; offset += FAVICON_CONCURRENCY) {
+  for (let offset = 0; offset < fetchable.length; offset += FAVICON_CONCURRENCY) {
     if (run !== faviconRun) {
       report(false);
       return;
     }
-    const rows = await Promise.all(pending.slice(offset, offset + FAVICON_CONCURRENCY).map((host) => fetchFavicon(source, host)));
+    const rows = await Promise.all(fetchable.slice(offset, offset + FAVICON_CONCURRENCY).map((host) => fetchFavicon(source, host, samples.get(host) ?? [])));
     for (const row of rows) {
       if (row.status === 'ok') ok += 1;
       else failed += 1;

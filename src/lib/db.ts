@@ -109,6 +109,10 @@ class CorralDatabase extends Dexie {
     this.version(2).stores({
       favicons: '&host, fetchedAt',
     });
+    // v3: status makes successful-cache counts cheap and accurate.
+    this.version(3).stores({
+      favicons: '&host, status, fetchedAt',
+    });
   }
 }
 

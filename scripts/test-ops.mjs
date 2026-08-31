@@ -93,6 +93,13 @@ assert((await getExtraFolders()).length === 0, 'no extras initially');
 await setExtraFolders(['Projects / Ideas', 'Archive', 'Projects / Ideas']);
 assert((await getExtraFolders()).join('|') === 'Archive|Projects / Ideas', 'extras deduped and sorted');
 
+// Favicon status is indexed so the UI can count only successful cached icons.
+await db.favicons.bulkPut([
+  { host: 'ok.example', bytes: new Blob(['icon']), status: 'ok', fetchedAt: Date.now() },
+  { host: 'missing.example', bytes: null, status: 'missing', fetchedAt: Date.now() },
+]);
+assert((await db.favicons.where('status').equals('ok').count()) === 1, 'favicon success count excludes missing rows');
+
 // Duplicate detection keys on the normalized URL stored at import time.
 const dupA = makeRecord({ title: 'Dup', url: 'https://Example.com/page/?utm_source=x#frag', folder: 'X', dateAdded: 1, source: 'json' });
 const dupB = makeRecord({ title: 'Dup again', url: 'https://example.com/page', folder: 'Y', dateAdded: 2, source: 'json' });

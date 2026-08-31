@@ -90,6 +90,8 @@ const emptyStats: LibraryStats = {
 
 const emptySearch: SearchState = { ids: [], total: 0, truncated: false, elapsedMs: 0, pending: false };
 
+const countCachedFavicons = () => db.favicons.where('status').equals('ok').count().catch(() => 0);
+
 export function countLabel(count: number, noun = 'bookmark') {
   return `${count.toLocaleString()} ${noun}${count === 1 ? '' : 's'}`;
 }
@@ -204,7 +206,7 @@ export function useCorral() {
     setStats(nextStats ?? (await getLibraryStats()));
     const sidebar = await runOp<{ folders: FolderCount[]; stale: boolean }>({ kind: 'folders' }).catch(() => ({ folders: [], stale: true }));
     if (!sidebar.stale) setFolders(sidebar.folders);
-    setFaviconCount(await db.favicons.count().catch(() => 0));
+    setFaviconCount(await countCachedFavicons());
     if (navigator.storage?.estimate) {
       const estimate = await navigator.storage.estimate();
       setStorageUsage(estimate.usage ?? 0);
@@ -274,7 +276,7 @@ export function useCorral() {
         setFavicons({ running: message.running, done: message.done, total: message.total, ok: message.ok, failed: message.failed, message: message.message });
         if (!message.running) {
           setIconVersion((version) => version + 1);
-          void db.favicons.count().then(setFaviconCount).catch(() => undefined);
+          void countCachedFavicons().then(setFaviconCount);
         }
       }
       if (message.type === 'fatal') {
@@ -742,8 +744,8 @@ export function useCorral() {
     // Extension pages read Chrome's own favicon cache; the dev preview goes
     // through the vite proxy to Google's favicon service.
     const source = extension
-      ? { mode: 'chrome' as const, prefix: chrome.runtime.getURL('_favicon/') }
-      : { mode: 's2' as const, prefix: '/s2-favicon?sz=32&domain=' };
+      ? { mode: 'chrome' as const, prefix: chrome.runtime.getURL('_favicon/'), retryFailures: true }
+      : { mode: 's2' as const, prefix: '/s2-favicon?sz=32&domain=', retryFailures: true };
     setFavicons({ running: true, done: 0, total: 0, ok: 0, failed: 0 });
     workerRef.current?.postMessage({ type: 'favicons', source });
   }, []);

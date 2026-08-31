@@ -3,6 +3,14 @@
 
 import { ShardBuilder, ShardStore, parseQuery } from '../src/lib/search-engine.ts';
 import { buildTree, findTreeNode } from '../src/lib/folder-tree.ts';
+import {
+  chromeFaviconPageUrlCandidates,
+  chromeFaviconUrl,
+  faviconNeedsFetch,
+  FAVICON_ERROR_RETRY_MS,
+  FAVICON_MISSING_RETRY_MS,
+  previewFaviconUrl,
+} from '../src/lib/favicon-cache.ts';
 import { ViewIndex, ViewIndexBuilder, serializeViewData, deserializeViewData } from '../src/lib/view-index.ts';
 
 const assert = (cond, label) => {
@@ -104,6 +112,22 @@ assert(workNode && workNode.total === 6, 'folder tree rolls up descendant links'
 assert(workNode.children.map((node) => node.path).join(',') === 'Work / Deep,Work / Peer', 'folder view exposes only immediate children');
 assert(workNode.children[0].total === 3 && workNode.children[0].own === 0, 'missing intermediate folder is synthesized');
 assert(findTreeNode(tree, 'Work / Deep / Archive')?.own === 3, 'nested folder remains addressable');
+
+// --- favicon cache policy + local Chrome URL candidates ------------------------
+const faviconNow = 2_000_000_000_000;
+const faviconRow = (status, age) => ({ host: 'example.com', bytes: status === 'ok' ? new Blob(['x']) : null, status, fetchedAt: faviconNow - age });
+assert(!faviconNeedsFetch(faviconRow('ok', 1_000), faviconNow, true), 'manual refresh preserves fresh successful icons');
+assert(faviconNeedsFetch(faviconRow('missing', 1_000), faviconNow, true), 'manual refresh retries recent missing icons');
+assert(faviconNeedsFetch(faviconRow('error', 1_000), faviconNow, true), 'manual refresh retries recent errors');
+assert(!faviconNeedsFetch(faviconRow('missing', FAVICON_MISSING_RETRY_MS - 1), faviconNow, false), 'missing result has a short automatic cooldown');
+assert(faviconNeedsFetch(faviconRow('error', FAVICON_ERROR_RETRY_MS + 1), faviconNow, false), 'transient errors retry after cooldown');
+const faviconCandidates = chromeFaviconPageUrlCandidates('example.com', ['http://www.example.com/saved/page', 'chrome://settings/']);
+assert(faviconCandidates[0] === 'http://www.example.com/saved/page', 'real bookmarked URL is the first Chrome favicon candidate');
+assert(faviconCandidates.includes('http://www.example.com/') && faviconCandidates.includes('https://example.com/'), 'origin and scheme fallbacks are retained');
+assert(chromeFaviconPageUrlCandidates('chrome', ['chrome://settings/']).length === 0, 'non-web bookmarks never trigger Chrome favicon requests');
+const chromeFaviconRequest = new URL(chromeFaviconUrl('chrome-extension://abc/_favicon/', 'http://www.example.com/saved/page'));
+assert(chromeFaviconRequest.searchParams.get('pageUrl') === 'http://www.example.com/saved/page' && chromeFaviconRequest.searchParams.get('size') === '32', 'Chrome request carries the actual page URL');
+assert(previewFaviconUrl('/s2-favicon?domain=', 'example.com') === '/s2-favicon?domain=example.com', 'external preview request contains only the host');
 
 // --- scoped search (accept predicate) ------------------------------------------
 const sb2 = new ShardBuilder();

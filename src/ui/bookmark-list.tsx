@@ -36,6 +36,8 @@ function SiteMark({ host }: { host: string }) {
           onError={(event) => {
             iconUrls.set(host, null);
             event.currentTarget.style.display = 'none';
+            // Do not leave undecodable bytes marked fresh for a month.
+            void db.favicons.delete(host);
           }}
         />
       )}
