@@ -453,10 +453,21 @@ export function useCorral() {
     });
   }, []);
 
-  const selectAll = useCallback(async () => {
-    const ids = await currentIds();
-    setSelected(new Set(ids));
-  }, [currentIds]);
+  const selectAllWithBaseUrl = useCallback(async () => {
+    const memberIds = Array.from(selected);
+    if (memberIds.length === 0) return;
+    try {
+      const { ids } = await runOp<{ hosts: string[]; ids: number[] }>({
+        kind: 'expand-host-selection',
+        ids: memberIds,
+        options: viewOptions(),
+      });
+      setSelected(new Set(ids));
+      selectionAnchorRef.current = null;
+    } catch (error) {
+      setToast({ message: error instanceof Error ? error.message : 'Could not select matching base URLs' });
+    }
+  }, [runOp, selected, viewOptions]);
 
   const clearSelection = useCallback(() => {
     setSelected(new Set());
@@ -711,7 +722,7 @@ export function useCorral() {
     selection, chooseView, sort, changeSort, density, setDensity,
     query, setQuery: updateQuery, deferredQuery, isSearching, search,
     itemCount, viewTotal, listVersion, loadPage, recordAt,
-    selected, setSelected, clickRow, toggleSelected, selectAll, clearSelection,
+    selected, setSelected, clickRow, toggleSelected, selectAllWithBaseUrl, clearSelection,
     moveIds, corralHost, deleteIds, importFromChrome, importFromFile, exportLibrary, hostCount,
     createFolder, renameFolder, moveFolder, deleteFolder, findDuplicates,
     favicons, faviconCount, iconVersion, buildFavicons, stopFavicons,

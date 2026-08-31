@@ -59,6 +59,9 @@ export type WorkerOp =
   // Read-only:
   | { kind: 'folders' }
   | { kind: 'host-count'; host: string }
+  /** Expands a selection to every bookmark with the same base hosts inside
+   * the active all/folder scope. */
+  | { kind: 'expand-host-selection'; ids: number[]; options: ViewOptions }
   | { kind: 'view-ids'; options: ViewOptions }
   | { kind: 'view-total'; options: ViewOptions };
 
@@ -572,6 +575,23 @@ async function runOp(op: WorkerOp, progress: Progress): Promise<OpOutcome> {
     case 'host-count':
       return { payload: { count: servingViews ? servingViews.hostCount(op.host) : 0 } };
 
+    case 'expand-host-selection': {
+      if (servingViews) return { payload: servingViews.hostExpansion(op.ids, op.options) };
+
+      // Before the in-memory index is ready, derive the same result from the
+      // live rows so the selection action remains available during a rebuild.
+      const members = await getRecordsByIds(op.ids);
+      const hostSet = new Set(members.map((record) => record.host));
+      const hosts = Array.from(hostSet).sort();
+      if (hosts.length === 0) return { payload: { hosts, ids: [] } };
+      const rows = await getFallbackPage({ ...op.options, offset: 0, limit: Number.MAX_SAFE_INTEGER });
+      const ids = rows
+        .filter((record) => hostSet.has(record.host))
+        .map((record) => record.id)
+        .filter((id): id is number => typeof id === 'number');
+      return { payload: { hosts, ids } };
+    }
+
     case 'view-ids': {
       if (servingViews) return { payload: { ids: servingViews.page(op.options, 0, Number.MAX_SAFE_INTEGER).ids } };
       const rows = await getFallbackPage({ ...op.options, offset: 0, limit: Number.MAX_SAFE_INTEGER });
@@ -733,7 +753,7 @@ async function buildFavicons(source: { mode: 'chrome' | 's2'; prefix: string }) 
   report(false);
 }
 
-const READ_ONLY_OPS = new Set(['folders', 'host-count', 'view-ids', 'view-total']);
+const READ_ONLY_OPS = new Set(['folders', 'host-count', 'expand-host-selection', 'view-ids', 'view-total']);
 
 /** Mutating ops run strictly serialized — a delete interleaving with a
  * streaming export would corrupt the export. Read-only ops answer instantly. */

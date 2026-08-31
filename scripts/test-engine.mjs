@@ -60,12 +60,21 @@ const folders = index.folders();
 assert(folders.length === 3 && folders[0].folder === 'Work' && folders[0].count === 2, 'folder counts');
 assert(index.hostCount('a.com') === 3 && index.hostCount('nope.example') === 0, 'host counts');
 assert(index.idsForHost('a.com').join(',') === '5,3,1', 'ids for host, newest first');
+const allHostExpansion = index.hostExpansion([2, 3], q());
+assert(allHostExpansion.hosts.join(',') === 'a.com,b.com', 'host expansion reports selected base hosts');
+assert(allHostExpansion.ids.join(',') === '1,2,3,4,5', 'host expansion selects every matching base host');
+const folderHostExpansion = index.hostExpansion([1], q({ view: 'folder', folder: 'Work', subtree: true }));
+assert(folderHostExpansion.ids.join(',') === '1,5', 'host expansion stays inside the folder subtree');
+const exactFolderHostExpansion = index.hostExpansion([1], q({ view: 'folder', folder: 'Work' }));
+assert(exactFolderHostExpansion.ids.join(',') === '1', 'host expansion respects an exact folder scope');
+assert(index.hostExpansion([999], q()).ids.length === 0, 'host expansion ignores unknown members');
 
 // Tombstones shrink everything.
 index.tombstone([5]);
 assert(index.page(q(), 0, 10).total === 4, 'tombstoned total');
 assert(index.idsForHost('a.com').join(',') === '3,1', 'tombstoned host ids');
 assert(index.hostCount('a.com') === 2, 'tombstoned host count');
+assert(index.hostExpansion([1], q()).ids.join(',') === '1,3', 'tombstones shrink host expansion');
 
 // Persistence round trip + legacy-shape rejection.
 const vb3 = new ViewIndexBuilder();

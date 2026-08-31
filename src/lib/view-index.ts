@@ -230,6 +230,56 @@ export class ViewIndex {
     return list;
   }
 
+  /** The base hosts of the given records, plus every live id inside the
+   * query's scope that shares one of those hosts — "select all on this site
+   * in the current folder". Sort/offset on the query are ignored; order is
+   * irrelevant to a selection. */
+  hostExpansion(memberIds: number[], query: ViewQuery): { hosts: string[]; ids: number[] } {
+    const { ids, hostIdOf, folderIdOf, hostNames, folderNames } = this.data;
+    const hostIds = new Set<number>();
+    for (const memberId of memberIds) {
+      const position = this.positionOf(memberId);
+      if (position !== -1) hostIds.add(hostIdOf[position]!);
+    }
+    if (hostIds.size === 0) return { hosts: [], ids: [] };
+
+    let wanted: Set<number> | null = null;
+    if (query.view === 'folder') {
+      wanted = new Set<number>();
+      const prefix = query.folder + FOLDER_SEPARATOR;
+      for (let id = 0; id < folderNames.length; id += 1) {
+        const name = folderNames[id]!;
+        if (name === query.folder || (query.subtree && name.startsWith(prefix))) wanted.add(id);
+      }
+    }
+
+    const expanded: number[] = [];
+    for (let position = 0; position < ids.length; position += 1) {
+      if (!hostIds.has(hostIdOf[position]!)) continue;
+      if (wanted && !wanted.has(folderIdOf[position]!)) continue;
+      const id = ids[position]!;
+      if (this.tombstones.has(id)) continue;
+      expanded.push(id);
+    }
+    const hosts = Array.from(hostIds, (hostId) => hostNames[hostId]!).sort();
+    return { hosts, ids: expanded };
+  }
+
+  /** Position of a record id in the ascending id column, or -1. */
+  private positionOf(recordId: number) {
+    const { ids } = this.data;
+    let low = 0;
+    let high = ids.length - 1;
+    while (low <= high) {
+      const mid = (low + high) >> 1;
+      const value = ids[mid]!;
+      if (value === recordId) return mid;
+      if (value < recordId) low = mid + 1;
+      else high = mid - 1;
+    }
+    return -1;
+  }
+
   /** All live record ids on the given host, newest first. */
   idsForHost(host: string): number[] {
     const hostId = this.data.hostNames.indexOf(host);

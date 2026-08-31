@@ -271,8 +271,8 @@ export function App() {
           {corral.selected.size > 0 && (
             <div className="selection-bar">
               <strong>{corral.selected.size.toLocaleString()} selected</strong>
-              {corral.selected.size < corral.itemCount && (
-                <button className="button ghost" onClick={() => void corral.selectAll()}>Select all {corral.itemCount.toLocaleString()}</button>
+              {corral.selected.size < corral.viewTotal && (
+                <button className="button ghost" onClick={() => void corral.selectAllWithBaseUrl()}>Select all with base URL</button>
               )}
               <button className="button ghost" onClick={corral.clearSelection}>Clear</button>
               <button className="button" onClick={() => setPicker({ kind: 'move', ids: Array.from(corral.selected), label: countLabel(corral.selected.size) })}>

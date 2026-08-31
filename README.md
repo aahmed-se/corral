@@ -13,7 +13,7 @@ Round up your bookmarks. Corral is a local-first bookmark organizer built for li
 - **Three row densities** — roomy, cozy, compact — switchable from the toolbar.
 - **Drag and drop at scale**: drag one row or a 50,000-row selection onto any folder in the tree (drop on "All bookmarks" to unfile). Spring-loaded folders expand while you hover, edges auto-scroll, Esc cancels, and every move offers Undo.
 - **Corral a domain**: right-click any bookmark → "Corral N bookmarks on site.com…" moves every bookmark on that host into a new or existing folder, with Undo.
-- Multi-select with click, Cmd/Ctrl-click, Shift-ranges, and Select-all over the whole view.
+- Multi-select with click, Cmd/Ctrl-click, Shift-ranges, and one-click expansion to every bookmark with the selected base URLs in the current folder.
 
 ## Architecture
 
