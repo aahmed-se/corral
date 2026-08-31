@@ -5,10 +5,13 @@ Round up your bookmarks. Corral is a local-first bookmark organizer built for li
 ## What it does
 
 - **Folder tree** on the left with live counts rolled up through every subtree, plus indexing status.
+- **Folder editing in place**: create folders (empty ones included), rename or re-parent a whole subtree from the right-click menu, drag one folder onto another to nest it, and remove empty folders. Renames rewrite every descendant path and offer Undo.
 - **Copy from Chrome** (a snapshot — Chrome's own tree is never modified), import Chrome/Firefox/Netscape HTML exports or Corral JSON backups, and export both formats back out.
-- **Lightning search**: true substring matching across titles, URLs, hosts, and folders, ~10 ms across 100k bookmarks, ranked by match field.
+- **Lightning search, scoped to where you are**: true substring matching across titles, URLs, hosts, and folders, ~10 ms across 100k bookmarks, ranked by match field. Select a folder and the same query narrows to that subtree — scoping happens inside the scan, so a small folder is never drowned out by a common term.
+- **Duplicate cleanup**: one toolbar button scans the library by normalized URL (tracking parameters, fragments, and case ignored), keeps the oldest copy of each link, and removes the rest — with a confirm step and Undo.
+- **Site icon cache**: fetch favicons for every bookmarked host (most-bookmarked first) into IndexedDB — via Chrome's own favicon store when running as the extension, or a dev-server relay in the preview. Resumable, stoppable, and rendered per row with a letter-mark fallback. Page titles/descriptions are deliberately not crawled — fetching 100k pages is not a background feature.
 - **Three row densities** — roomy, cozy, compact — switchable from the toolbar.
-- **Drag and drop at scale**: drag one row or a 50,000-row selection onto any folder in the tree. Spring-loaded folders expand while you hover, edges auto-scroll, Esc cancels, and every move offers Undo.
+- **Drag and drop at scale**: drag one row or a 50,000-row selection onto any folder in the tree (drop on "All bookmarks" to unfile). Spring-loaded folders expand while you hover, edges auto-scroll, Esc cancels, and every move offers Undo.
 - **Corral a domain**: right-click any bookmark → "Corral N bookmarks on site.com…" moves every bookmark on that host into a new or existing folder, with Undo.
 - Multi-select with click, Cmd/Ctrl-click, Shift-ranges, and Select-all over the whole view.
 
