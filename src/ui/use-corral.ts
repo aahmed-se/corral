@@ -602,9 +602,11 @@ export function useCorral() {
     try {
       const tree = await chrome.bookmarks.getTree();
       const inputs = flattenChromeTree(tree);
-      const { imported } = await runOp<{ imported: number }>({ kind: 'import-chrome', inputs }, setBusyLabel);
+      const { imported, skipped } = await runOp<{ imported: number; skipped: number }>({ kind: 'import-chrome', inputs }, setBusyLabel);
       await refreshAfterMutation();
-      setToast({ message: `${countLabel(imported)} copied from Chrome · indexing continues in the background` });
+      setToast({ message: imported > 0
+        ? `${countLabel(imported)} new from Chrome · ${countLabel(skipped)} already kept`
+        : `No new Chrome bookmarks · ${countLabel(skipped)} already kept` });
     } catch (error) {
       setToast({ message: error instanceof Error ? error.message : 'Chrome copy failed' });
       await refreshAfterMutation().catch(() => undefined);
@@ -618,9 +620,11 @@ export function useCorral() {
     setBusyLabel(`Reading ${file.name}…`);
     try {
       const text = await file.text();
-      const { imported } = await runOp<{ imported: number }>({ kind: 'import-file', name: file.name, text }, setBusyLabel);
+      const { imported, skipped } = await runOp<{ imported: number; skipped: number }>({ kind: 'import-file', name: file.name, text }, setBusyLabel);
       await refreshAfterMutation();
-      setToast({ message: `${countLabel(imported)} imported · indexing continues in the background` });
+      setToast({ message: imported > 0
+        ? `${countLabel(imported)} new · ${countLabel(skipped)} already kept`
+        : `Nothing new to import · ${countLabel(skipped)} already kept` });
     } catch (error) {
       setToast({ message: error instanceof Error ? error.message : 'Could not import that file' });
     } finally {

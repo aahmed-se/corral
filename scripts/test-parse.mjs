@@ -3,6 +3,7 @@
 
 import { parseNetscapeHtml, parseBookmarkJson, toNetscapeHtmlParts, flattenChromeTree } from '../src/lib/import-export.ts';
 import { makeRecord } from '../src/lib/db.ts';
+import { countImportKeys, importKey, selectUnmatchedInputs } from '../src/lib/import-merge.ts';
 
 const assert = (cond, label) => {
   if (!cond) {
@@ -58,6 +59,20 @@ for (const record of records) {
 // JSON import shape.
 const json = parseBookmarkJson(JSON.stringify({ records: [{ title: 'J', url: 'https://j.example/x', folder: 'F', dateAdded: 5 }] }));
 assert(json.length === 1 && json[0].folder === 'F', 'json import');
+
+// Repeat imports merge without changing current records. Matching is based on
+// normalized URL, so local folder state and tracking-parameter differences do
+// not create replacement rows. Duplicate multiplicity is still preserved.
+const repeatInputs = [
+  { title: 'One', url: 'https://Example.com/page/?utm_source=again#top', folder: 'Imported', dateAdded: 1, source: 'html' },
+  { title: 'Second copy', url: 'https://example.com/page', folder: 'Elsewhere', dateAdded: 2, source: 'html' },
+  { title: 'New', url: 'https://new.example/item', folder: 'Imported', dateAdded: 3, source: 'html' },
+];
+const wantedKeys = countImportKeys(repeatInputs);
+assert(wantedKeys.get(importKey(repeatInputs[0])) === 2, 'import merge counts normalized URL copies');
+const { additions, skipped } = selectUnmatchedInputs(repeatInputs, new Map([[importKey(repeatInputs[0]), 1]]));
+assert(skipped === 1 && additions.length === 2, 'import merge skips only existing copies');
+assert(additions.some((input) => input.url.includes('new.example')), 'import merge retains new URLs');
 
 // Chrome tree flattening.
 const tree = [{

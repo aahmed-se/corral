@@ -28,6 +28,7 @@ import {
   type ViewOptions,
 } from './db.ts';
 import { parseBookmarkJson, parseNetscapeHtml, toNetscapeHtmlParts, type RawBookmarkInput } from './import-export.ts';
+import { countImportKeys, importKey, selectUnmatchedInputs } from './import-merge.ts';
 import {
   chromeFaviconPageUrlCandidates,
   chromeFaviconUrl,
@@ -338,6 +339,36 @@ async function insertInputs(inputs: RawBookmarkInput[], progress: Progress) {
   return written;
 }
 
+/** Returns only import entries not already represented in the current
+ * library. Existing rows are read but never changed, so repeat imports retain
+ * local folder moves and every other piece of current state. */
+async function newImportInputs(inputs: RawBookmarkInput[], progress: Progress) {
+  const wanted = countImportKeys(inputs);
+  const matched = new Map<string, number>();
+  const total = await db.bookmarks.count();
+  let scanned = 0;
+  let matchedTotal = 0;
+  let lastId = 0;
+  while (scanned < total && matchedTotal < inputs.length) {
+    const records = await db.bookmarks.where('id').above(lastId).limit(SCAN_CHUNK).toArray();
+    if (records.length === 0) break;
+    lastId = records.at(-1)?.id ?? lastId;
+    for (const record of records) {
+      const key = importKey(record);
+      const needed = wanted.get(key) ?? 0;
+      const found = matched.get(key) ?? 0;
+      if (found < needed) {
+        matched.set(key, found + 1);
+        matchedTotal += 1;
+      }
+    }
+    scanned += records.length;
+    progress(`Checked ${count(Math.min(scanned, total))} already in Corral…`);
+    await yieldToQueue();
+  }
+  return selectUnmatchedInputs(inputs, matched);
+}
+
 /** Moves ids and returns each record's prior folder for the undo toast. */
 async function moveWithUndo(ids: number[], destination: string, progress: Progress) {
   const records = await getRecordsByIds(ids, (read) => progress(`Reading ${count(read)} of ${count(ids.length)}…`));
@@ -410,22 +441,19 @@ async function runOp(op: WorkerOp, progress: Progress): Promise<OpOutcome> {
       progress(`Parsing ${op.name}…`);
       const inputs = op.name.toLowerCase().endsWith('.json') ? parseBookmarkJson(op.text) : parseNetscapeHtml(op.text);
       if (inputs.length === 0) throw new Error('No bookmarks were found in that file.');
+      const { additions, skipped } = await newImportInputs(inputs, progress);
+      if (additions.length === 0) return { payload: { imported: 0, skipped } };
       await markLibraryDirty();
-      const imported = await insertInputs(inputs, progress);
-      return { payload: { imported }, rebuild: true, staleViews: true };
+      const imported = await insertInputs(additions, progress);
+      return { payload: { imported, skipped }, rebuild: true, staleViews: true };
     }
 
     case 'import-chrome': {
-      const existing = await db.bookmarks.where('source').equals('chrome').toArray();
+      const { additions, skipped } = await newImportInputs(op.inputs, progress);
+      if (additions.length === 0) return { payload: { imported: 0, skipped } };
       await markLibraryDirty();
-      let tombstoneIds: number[] = [];
-      if (existing.length > 0) {
-        progress('Replacing the previous Chrome copy…');
-        await db.bookmarks.where('source').equals('chrome').delete();
-        tombstoneIds = existing.map((record) => record.id).filter((id): id is number => typeof id === 'number');
-      }
-      const imported = await insertInputs(op.inputs, progress);
-      return { payload: { imported, replaced: existing.length }, rebuild: true, staleViews: true, tombstoneIds };
+      const imported = await insertInputs(additions, progress);
+      return { payload: { imported, skipped }, rebuild: true, staleViews: true };
     }
 
     case 'move': {

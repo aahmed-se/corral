@@ -212,14 +212,14 @@ export function ImportDialog({ canUseChrome, busy, onChrome, onFile, onClose }: 
           <span className="choice-icon"><Compass /></span>
           <span>
             <strong>Copy from Chrome</strong>
-            <small>{canUseChrome ? 'Snapshots the live bookmark tree. Chrome itself is never modified.' : 'Available when Corral runs as a Chrome extension.'}</small>
+            <small>{canUseChrome ? 'Adds new bookmarks while keeping your current Corral organization.' : 'Available when Corral runs as a Chrome extension.'}</small>
           </span>
         </button>
         <button className="choice" disabled={busy} onClick={() => fileRef.current?.click()}>
           <span className="choice-icon"><FileUp /></span>
           <span>
             <strong>Import a file</strong>
-            <small>Chrome/Firefox/Netscape HTML export, or a Corral JSON backup.</small>
+            <small>Merges an HTML export or Corral JSON backup without replacing current bookmarks.</small>
           </span>
         </button>
         <input
