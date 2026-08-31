@@ -1,0 +1,589 @@
+import { useCallback, useDeferredValue, useEffect, useRef, useState } from 'react';
+// Vite provides the constructor for `?worker` imports at build time.
+import EngineWorker from '../lib/worker.ts?worker';
+import type { IndexPhase, WorkerOp, WorkerResponse } from '../lib/worker.ts';
+import {
+  db,
+  getFallbackPage,
+  getLibraryStats,
+  type BookmarkRecord,
+  type FolderCount,
+  type LibraryStats,
+  type SortMode,
+  type ViewOptions,
+} from '../lib/db.ts';
+import { chromeBookmarksAvailable, downloadBlob, flattenChromeTree } from '../lib/import-export.ts';
+
+export const PAGE_SIZE = 240;
+const SEARCH_LIMIT = 5_000;
+const OP_SILENCE_TIMEOUT = 120_000;
+
+export type IndexState = {
+  status: 'starting' | 'indexing' | 'ready' | 'error';
+  phase: IndexPhase;
+  done: number;
+  total: number;
+  restored: boolean;
+  message: string;
+};
+
+export type SearchState = {
+  ids: number[];
+  total: number;
+  truncated: boolean;
+  elapsedMs: number;
+  pending: boolean;
+};
+
+export type Density = 'roomy' | 'cozy' | 'compact';
+
+export type ViewSelection = { view: 'all' | 'folder'; folder: string };
+
+export type ToastState = {
+  message: string;
+  undo?: () => void;
+};
+
+type UndoPlan =
+  | { kind: 'folders'; moves: Array<{ id: number; folder: string }> }
+  | { kind: 'records'; records: BookmarkRecord[] };
+
+type PageResult = { rows: Array<BookmarkRecord | undefined>; total?: number };
+
+type PendingPage = { resolve: (result: PageResult) => void; reject: (error: Error) => void; timer: number };
+
+type PendingOp = {
+  resolve: (payload: unknown) => void;
+  reject: (error: Error) => void;
+  onProgress?: (label: string) => void;
+  watchdog: number;
+};
+
+const emptyStats: LibraryStats = {
+  key: 'stats',
+  revision: 0,
+  dirtyRevision: 0,
+  total: 0,
+  hosts: 0,
+  folders: 0,
+  shards: 0,
+  indexedAt: 0,
+  buildMs: 0,
+};
+
+const emptySearch: SearchState = { ids: [], total: 0, truncated: false, elapsedMs: 0, pending: false };
+
+export function countLabel(count: number, noun = 'bookmark') {
+  return `${count.toLocaleString()} ${noun}${count === 1 ? '' : 's'}`;
+}
+
+function createPendingOp(
+  resolve: (payload: unknown) => void,
+  reject: (error: Error) => void,
+  onProgress: ((label: string) => void) | undefined,
+  expire: () => void,
+): PendingOp {
+  const pending: PendingOp = {
+    resolve,
+    reject,
+    onProgress: (label) => {
+      window.clearTimeout(pending.watchdog);
+      pending.watchdog = window.setTimeout(expire, OP_SILENCE_TIMEOUT);
+      onProgress?.(label);
+    },
+    watchdog: window.setTimeout(expire, OP_SILENCE_TIMEOUT),
+  };
+  return pending;
+}
+
+export function useCorral() {
+  const [stats, setStats] = useState<LibraryStats>(emptyStats);
+  const [folders, setFolders] = useState<FolderCount[]>([]);
+  const [index, setIndex] = useState<IndexState>({ status: 'starting', phase: 'scanning', done: 0, total: 0, restored: false, message: '' });
+  const [storageUsage, setStorageUsage] = useState(0);
+
+  const [selection, setSelection] = useState<ViewSelection>({ view: 'all', folder: '' });
+  const [sort, setSort] = useState<SortMode>('newest');
+  const [density, setDensity] = useState<Density>(() => {
+    const stored = typeof window === 'undefined' ? null : window.localStorage.getItem('corral-density');
+    return stored === 'roomy' || stored === 'cozy' || stored === 'compact' ? stored : 'cozy';
+  });
+
+  const [query, setQuery] = useState('');
+  const deferredQuery = useDeferredValue(query.trim());
+  const [search, setSearch] = useState<SearchState>(emptySearch);
+
+  const [viewTotal, setViewTotal] = useState(0);
+  const [pageCache, setPageCache] = useState<Map<string, Array<BookmarkRecord | undefined>>>(new Map());
+  const [listVersion, setListVersion] = useState(0);
+
+  const [selected, setSelected] = useState<Set<number>>(new Set());
+  const [busy, setBusy] = useState(false);
+  const [busyLabel, setBusyLabel] = useState('');
+  const [toast, setToast] = useState<ToastState | null>(null);
+
+  const workerRef = useRef<Worker | null>(null);
+  const searchRequestRef = useRef(0);
+  const pageRequestRef = useRef(0);
+  const opRequestRef = useRef(0);
+  const pendingPagesRef = useRef(new Map<number, PendingPage>());
+  const pendingOpsRef = useRef(new Map<number, PendingOp>());
+  const loadingPagesRef = useRef(new Map<string, number>());
+  const pageGenerationRef = useRef(0);
+  const searchIdsRef = useRef<number[]>([]);
+  const lastTrimmedQueryRef = useRef('');
+  const viewIdsCacheRef = useRef<{ version: number; ids: number[] } | null>(null);
+  const selectionAnchorRef = useRef<number | null>(null);
+
+  const canUseChrome = chromeBookmarksAvailable();
+  const isSearching = deferredQuery.length > 0;
+
+  const viewOptions = useCallback(
+    (offset = 0, limit = 0): ViewOptions => ({ view: selection.view, folder: selection.folder, subtree: true, sort, offset, limit }),
+    [selection.folder, selection.view, sort],
+  );
+
+  // --- worker RPC -------------------------------------------------------------
+  const runOp = useCallback(<T,>(op: WorkerOp, onProgress?: (label: string) => void) => {
+    const worker = workerRef.current;
+    if (!worker) return Promise.reject(new Error('The engine is still starting.'));
+    const requestId = ++opRequestRef.current;
+    return new Promise<T>((resolve, reject) => {
+      const pending = createPendingOp(resolve as (payload: unknown) => void, reject, onProgress, () => {
+        pendingOpsRef.current.delete(requestId);
+        reject(new Error('The operation stopped responding. Reload and try again.'));
+      });
+      pendingOpsRef.current.set(requestId, pending);
+      try {
+        worker.postMessage({ type: 'op', requestId, op });
+      } catch (error) {
+        window.clearTimeout(pending.watchdog);
+        pendingOpsRef.current.delete(requestId);
+        reject(error instanceof Error ? error : new Error('The engine rejected the request.'));
+      }
+    });
+  }, []);
+
+  const requestPage = useCallback((options: ViewOptions) => {
+    const worker = workerRef.current;
+    if (!worker) return Promise.reject(new Error('The engine is still starting.'));
+    const requestId = ++pageRequestRef.current;
+    return new Promise<PageResult>((resolve, reject) => {
+      const timer = window.setTimeout(() => {
+        pendingPagesRef.current.delete(requestId);
+        reject(new Error('The page request timed out.'));
+      }, 6_000);
+      pendingPagesRef.current.set(requestId, { resolve, reject, timer });
+      worker.postMessage({ type: 'page', requestId, options });
+    });
+  }, []);
+
+  const refreshMetadata = useCallback(async (nextStats?: LibraryStats) => {
+    setStats(nextStats ?? (await getLibraryStats()));
+    const sidebar = await runOp<{ folders: FolderCount[]; stale: boolean }>({ kind: 'folders' }).catch(() => ({ folders: [], stale: true }));
+    if (!sidebar.stale) setFolders(sidebar.folders);
+    if (navigator.storage?.estimate) {
+      const estimate = await navigator.storage.estimate();
+      setStorageUsage(estimate.usage ?? 0);
+    }
+  }, [runOp]);
+
+  const invalidateList = useCallback(() => {
+    pageGenerationRef.current += 1;
+    loadingPagesRef.current.clear();
+    viewIdsCacheRef.current = null;
+    setPageCache(new Map());
+    setListVersion((version) => version + 1);
+  }, []);
+
+  const dropInFlightPages = useCallback(() => {
+    pageGenerationRef.current += 1;
+    loadingPagesRef.current.clear();
+  }, []);
+
+  // --- worker lifecycle ---------------------------------------------------------
+  useEffect(() => {
+    const worker = new EngineWorker();
+    const pendingPages = pendingPagesRef.current;
+    const pendingOps = pendingOpsRef.current;
+    workerRef.current = worker;
+    worker.onmessage = (event: MessageEvent<WorkerResponse>) => {
+      const message = event.data;
+      if (message.type === 'phase') {
+        setIndex((current) => ({ ...current, status: 'indexing', phase: message.phase, done: message.done, total: message.total }));
+      }
+      if (message.type === 'ready') {
+        setIndex({ status: 'ready', phase: 'scanning', done: message.stats.total, total: message.stats.total, restored: message.restored, message: '' });
+        void refreshMetadata(message.stats);
+      }
+      if (message.type === 'results') {
+        if (message.requestId !== searchRequestRef.current) return;
+        pageGenerationRef.current += 1;
+        for (const key of loadingPagesRef.current.keys()) if (key.startsWith('s')) loadingPagesRef.current.delete(key);
+        searchIdsRef.current = message.ids;
+        setSearch({ ids: message.ids, total: message.total, truncated: message.truncated, elapsedMs: message.elapsedMs, pending: false });
+        setPageCache((current) => {
+          const next = new Map(current);
+          for (const key of next.keys()) if (key.startsWith('s')) next.delete(key);
+          return next;
+        });
+      }
+      if (message.type === 'page' || message.type === 'page-error') {
+        const pending = pendingPagesRef.current.get(message.requestId);
+        if (!pending) return;
+        window.clearTimeout(pending.timer);
+        pendingPagesRef.current.delete(message.requestId);
+        if (message.type === 'page') pending.resolve({ rows: message.rows, total: message.total });
+        else pending.reject(new Error(message.message));
+      }
+      if (message.type === 'op-progress') {
+        pendingOpsRef.current.get(message.requestId)?.onProgress?.(message.label);
+      }
+      if (message.type === 'op-done' || message.type === 'op-error') {
+        const pending = pendingOpsRef.current.get(message.requestId);
+        if (!pending) return;
+        window.clearTimeout(pending.watchdog);
+        pendingOpsRef.current.delete(message.requestId);
+        if (message.type === 'op-done') pending.resolve(message.payload);
+        else pending.reject(new Error(message.message));
+      }
+      if (message.type === 'fatal') {
+        setIndex((current) => ({ ...current, status: 'error', message: message.message }));
+      }
+    };
+    worker.onerror = () => {
+      setIndex((current) => ({ ...current, status: 'error', message: 'The engine worker stopped unexpectedly.' }));
+      for (const pending of pendingOps.values()) {
+        window.clearTimeout(pending.watchdog);
+        pending.reject(new Error('The engine worker stopped unexpectedly.'));
+      }
+      pendingOps.clear();
+    };
+
+    void (async () => {
+      try {
+        await refreshMetadata();
+        worker.postMessage({ type: 'init' });
+      } catch (error) {
+        setIndex((current) => ({ ...current, status: 'error', message: error instanceof Error ? error.message : 'The library could not be opened.' }));
+      }
+    })();
+
+    return () => {
+      for (const pending of pendingPages.values()) window.clearTimeout(pending.timer);
+      pendingPages.clear();
+      for (const pending of pendingOps.values()) window.clearTimeout(pending.watchdog);
+      pendingOps.clear();
+      worker.terminate();
+      workerRef.current = null;
+    };
+  }, [refreshMetadata]);
+
+  useEffect(() => {
+    window.localStorage.setItem('corral-density', density);
+  }, [density]);
+
+  // --- view totals + invalidation ------------------------------------------------
+  useEffect(() => {
+    let cancelled = false;
+    void runOp<{ total: number }>({ kind: 'view-total', options: { view: selection.view, folder: selection.folder, subtree: true, sort, offset: 0, limit: 0 } })
+      .catch(() => ({ total: 0 }))
+      .then(({ total }) => {
+        if (cancelled) return;
+        setViewTotal(total);
+        invalidateList();
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [invalidateList, runOp, selection.folder, selection.view, sort, stats]);
+
+  // --- search -------------------------------------------------------------------
+  const updateQuery = useCallback((value: string) => {
+    const trimmed = value.trim();
+    setQuery(value);
+    if (trimmed && trimmed !== lastTrimmedQueryRef.current) {
+      setSearch((current) => ({ ...current, pending: true }));
+    } else if (!trimmed && lastTrimmedQueryRef.current) {
+      searchRequestRef.current += 1;
+      searchIdsRef.current = [];
+      setSearch(emptySearch);
+    }
+    lastTrimmedQueryRef.current = trimmed;
+  }, []);
+
+  useEffect(() => {
+    if (!deferredQuery) return;
+    const requestId = ++searchRequestRef.current;
+    const timer = window.setTimeout(() => {
+      workerRef.current?.postMessage({ type: 'search', requestId, query: deferredQuery, limit: SEARCH_LIMIT });
+    }, 30);
+    return () => window.clearTimeout(timer);
+  }, [deferredQuery, index.status]);
+
+  // --- toast --------------------------------------------------------------------
+  useEffect(() => {
+    if (!toast) return;
+    const timer = window.setTimeout(() => setToast(null), toast.undo ? 8_000 : 3_500);
+    return () => window.clearTimeout(timer);
+  }, [toast]);
+
+  // --- paging -------------------------------------------------------------------
+  const loadPage = useCallback((page: number, searching: boolean) => {
+    const key = `${searching ? 's' : 'v'}${page}`;
+    if (loadingPagesRef.current.has(key)) return;
+    const generation = pageGenerationRef.current;
+    loadingPagesRef.current.set(key, generation);
+    const request: Promise<PageResult> = searching
+      ? db.bookmarks.bulkGet(searchIdsRef.current.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE)).then((rows) => ({ rows }))
+      : requestPage(viewOptions(page * PAGE_SIZE, PAGE_SIZE)).catch(async () => ({ rows: await getFallbackPage(viewOptions(page * PAGE_SIZE, PAGE_SIZE)) }));
+    void request
+      .then(({ rows, total }) => {
+        if (generation !== pageGenerationRef.current) {
+          if (loadingPagesRef.current.get(key) === generation) loadingPagesRef.current.delete(key);
+          return;
+        }
+        setPageCache((current) => {
+          const next = new Map(current);
+          next.set(key, rows);
+          return next;
+        });
+        if (!searching && typeof total === 'number') setViewTotal((current) => (current === total ? current : total));
+      })
+      .catch(() => {
+        if (loadingPagesRef.current.get(key) === generation) loadingPagesRef.current.delete(key);
+      });
+  }, [requestPage, viewOptions]);
+
+  const recordAt = useCallback(
+    (rowIndex: number) => {
+      const key = `${isSearching ? 's' : 'v'}${Math.floor(rowIndex / PAGE_SIZE)}`;
+      return pageCache.get(key)?.[rowIndex % PAGE_SIZE];
+    },
+    [isSearching, pageCache],
+  );
+
+  // --- navigation -----------------------------------------------------------------
+  const chooseView = useCallback((view: ViewSelection) => {
+    dropInFlightPages();
+    updateQuery('');
+    setSelection(view);
+    setSelected(new Set());
+    selectionAnchorRef.current = null;
+  }, [dropInFlightPages, updateQuery]);
+
+  const changeSort = useCallback((mode: SortMode) => {
+    dropInFlightPages();
+    setSort(mode);
+  }, [dropInFlightPages]);
+
+  // --- selection -------------------------------------------------------------------
+  /** Ordered ids of the current list (view or search), cached per invalidation. */
+  const currentIds = useCallback(async () => {
+    if (isSearching) return searchIdsRef.current;
+    const cached = viewIdsCacheRef.current;
+    const version = pageGenerationRef.current;
+    if (cached && cached.version === version) return cached.ids;
+    const { ids } = await runOp<{ ids: number[] }>({ kind: 'view-ids', options: viewOptions() });
+    viewIdsCacheRef.current = { version, ids };
+    return ids;
+  }, [isSearching, runOp, viewOptions]);
+
+  const clickRow = useCallback(async (rowIndex: number, record: BookmarkRecord, event: { shiftKey: boolean; metaKey: boolean; ctrlKey: boolean }) => {
+    const id = record.id!;
+    const toggle = event.metaKey || event.ctrlKey;
+    if (event.shiftKey && selectionAnchorRef.current !== null) {
+      const anchor = selectionAnchorRef.current;
+      const ids = await currentIds();
+      const [from, to] = anchor <= rowIndex ? [anchor, rowIndex] : [rowIndex, anchor];
+      const range = ids.slice(from, to + 1);
+      setSelected((current) => {
+        const next = toggle ? new Set(current) : new Set<number>();
+        for (const member of range) next.add(member);
+        return next;
+      });
+      return;
+    }
+    selectionAnchorRef.current = rowIndex;
+    setSelected((current) => {
+      if (toggle) {
+        const next = new Set(current);
+        if (next.has(id)) next.delete(id);
+        else next.add(id);
+        return next;
+      }
+      return new Set([id]);
+    });
+  }, [currentIds]);
+
+  const toggleSelected = useCallback((record: BookmarkRecord) => {
+    const id = record.id;
+    if (!id) return;
+    setSelected((current) => {
+      const next = new Set(current);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }, []);
+
+  const selectAll = useCallback(async () => {
+    const ids = await currentIds();
+    setSelected(new Set(ids));
+  }, [currentIds]);
+
+  const clearSelection = useCallback(() => {
+    setSelected(new Set());
+    selectionAnchorRef.current = null;
+  }, []);
+
+  // --- mutations --------------------------------------------------------------------
+  const refreshAfterMutation = useCallback(async () => {
+    setSelected(new Set());
+    selectionAnchorRef.current = null;
+    invalidateList();
+    const total = await db.bookmarks.count();
+    setStats((current) => ({ ...current, total }));
+  }, [invalidateList]);
+
+  const offerUndo = useCallback((message: string, plan: UndoPlan | null) => {
+    if (!plan || (plan.kind === 'folders' && plan.moves.length === 0) || (plan.kind === 'records' && plan.records.length === 0)) {
+      setToast({ message });
+      return;
+    }
+    setToast({
+      message,
+      undo: () => {
+        setToast(null);
+        setBusy(true);
+        const op: WorkerOp = plan.kind === 'folders' ? { kind: 'restore-folders', moves: plan.moves } : { kind: 'restore-records', records: plan.records };
+        runOp<{ restored: number }>(op, setBusyLabel)
+          .then(async ({ restored }) => {
+            await refreshAfterMutation();
+            setToast({ message: `${countLabel(restored)} restored` });
+          })
+          .catch((error) => setToast({ message: error instanceof Error ? error.message : 'Undo failed' }))
+          .finally(() => setBusy(false));
+      },
+    });
+  }, [refreshAfterMutation, runOp]);
+
+  const moveIds = useCallback(async (ids: number[], destination: string) => {
+    if (ids.length === 0 || !destination.trim()) return;
+    setBusy(true);
+    setBusyLabel(`Moving ${countLabel(ids.length)}…`);
+    try {
+      const { moved, destination: applied, priorFolders } = await runOp<{ moved: number; destination: string; priorFolders: Array<{ id: number; folder: string }> }>(
+        { kind: 'move', ids, destination },
+        setBusyLabel,
+      );
+      await refreshAfterMutation();
+      offerUndo(`${countLabel(moved)} moved to ${applied}`, { kind: 'folders', moves: priorFolders });
+    } catch (error) {
+      setToast({ message: error instanceof Error ? error.message : 'Could not move those bookmarks' });
+    } finally {
+      setBusy(false);
+    }
+  }, [offerUndo, refreshAfterMutation, runOp]);
+
+  const corralHost = useCallback(async (host: string, destination: string) => {
+    if (!host || !destination.trim()) return;
+    setBusy(true);
+    setBusyLabel(`Corralling ${host}…`);
+    try {
+      const { moved, destination: applied, priorFolders } = await runOp<{ moved: number; destination: string; priorFolders: Array<{ id: number; folder: string }> }>(
+        { kind: 'corral-host', host, destination },
+        setBusyLabel,
+      );
+      await refreshAfterMutation();
+      offerUndo(`${countLabel(moved)} from ${host} corralled into ${applied}`, { kind: 'folders', moves: priorFolders });
+    } catch (error) {
+      setToast({ message: error instanceof Error ? error.message : 'Could not corral that site' });
+    } finally {
+      setBusy(false);
+    }
+  }, [offerUndo, refreshAfterMutation, runOp]);
+
+  const deleteIds = useCallback(async (ids: number[]) => {
+    if (ids.length === 0) return;
+    setBusy(true);
+    setBusyLabel(`Removing ${countLabel(ids.length)}…`);
+    try {
+      const { deleted, undoRecords } = await runOp<{ deleted: number; undoRecords: BookmarkRecord[] | null }>({ kind: 'delete', ids }, setBusyLabel);
+      await refreshAfterMutation();
+      offerUndo(`${countLabel(deleted)} removed`, undoRecords ? { kind: 'records', records: undoRecords } : null);
+    } catch (error) {
+      setToast({ message: error instanceof Error ? error.message : 'Could not remove those bookmarks' });
+    } finally {
+      setBusy(false);
+    }
+  }, [offerUndo, refreshAfterMutation, runOp]);
+
+  const importFromChrome = useCallback(async () => {
+    if (!canUseChrome) return;
+    setBusy(true);
+    setBusyLabel('Reading the Chrome bookmark tree…');
+    try {
+      const tree = await chrome.bookmarks.getTree();
+      const inputs = flattenChromeTree(tree);
+      const { imported } = await runOp<{ imported: number }>({ kind: 'import-chrome', inputs }, setBusyLabel);
+      await refreshAfterMutation();
+      setToast({ message: `${countLabel(imported)} copied from Chrome · indexing continues in the background` });
+    } catch (error) {
+      setToast({ message: error instanceof Error ? error.message : 'Chrome copy failed' });
+      await refreshAfterMutation().catch(() => undefined);
+    } finally {
+      setBusy(false);
+    }
+  }, [canUseChrome, refreshAfterMutation, runOp]);
+
+  const importFromFile = useCallback(async (file: File) => {
+    setBusy(true);
+    setBusyLabel(`Reading ${file.name}…`);
+    try {
+      const text = await file.text();
+      const { imported } = await runOp<{ imported: number }>({ kind: 'import-file', name: file.name, text }, setBusyLabel);
+      await refreshAfterMutation();
+      setToast({ message: `${countLabel(imported)} imported · indexing continues in the background` });
+    } catch (error) {
+      setToast({ message: error instanceof Error ? error.message : 'Could not import that file' });
+    } finally {
+      setBusy(false);
+    }
+  }, [refreshAfterMutation, runOp]);
+
+  const exportLibrary = useCallback(async (format: 'json' | 'html', onlySelection: boolean) => {
+    setBusy(true);
+    setBusyLabel('Preparing export…');
+    try {
+      const ids = onlySelection && selected.size > 0 ? Array.from(selected) : undefined;
+      const { blob, exported, filename } = await runOp<{ blob: Blob; exported: number; filename: string }>({ kind: 'export', format, ids }, setBusyLabel);
+      downloadBlob(filename, blob);
+      setToast({ message: `${countLabel(exported)} exported` });
+    } catch (error) {
+      setToast({ message: error instanceof Error ? error.message : 'Could not export' });
+    } finally {
+      setBusy(false);
+    }
+  }, [runOp, selected]);
+
+  const hostCount = useCallback(async (host: string) => {
+    const { count } = await runOp<{ count: number }>({ kind: 'host-count', host });
+    return count;
+  }, [runOp]);
+
+  const itemCount = isSearching ? search.ids.length : viewTotal;
+
+  return {
+    stats, folders, index, storageUsage,
+    selection, chooseView, sort, changeSort, density, setDensity,
+    query, setQuery: updateQuery, deferredQuery, isSearching, search,
+    itemCount, viewTotal, listVersion, loadPage, recordAt,
+    selected, setSelected, clickRow, toggleSelected, selectAll, clearSelection,
+    moveIds, corralHost, deleteIds, importFromChrome, importFromFile, exportLibrary, hostCount,
+    canUseChrome, busy, busyLabel, toast, setToast,
+    requestRebuild: useCallback(() => workerRef.current?.postMessage({ type: 'rebuild' }), []),
+  };
+}
+
+export type Corral = ReturnType<typeof useCorral>;
