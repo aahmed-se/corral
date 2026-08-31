@@ -5,7 +5,7 @@
 
 import 'fake-indexeddb/auto';
 
-const { db, makeRecord, moveToFolder, deleteByIds, getRecordsByIds, addRecordsInBatches, getFallbackPage, markLibraryDirty, getDirtyRevision } =
+const { db, makeRecord, moveToFolder, deleteByIds, getRecordsByIds, addRecordsInBatches, getFallbackPage, markLibraryDirty, getDirtyRevision, getExtraFolders, setExtraFolders } =
   await import('../src/lib/db.ts');
 const { ViewIndex, ViewIndexBuilder } = await import('../src/lib/view-index.ts');
 
@@ -87,6 +87,18 @@ const workPage = await getFallbackPage({ view: 'folder', folder: 'Work / Deep', 
 assert(workPage.every((record) => record.folder === 'Work / Deep'), 'fallback folder page');
 const subtreePage = await getFallbackPage({ view: 'folder', folder: 'Work', subtree: true, sort: 'newest', offset: 0, limit: 10 });
 assert(subtreePage.every((record) => record.folder.startsWith('Work')), 'fallback subtree page');
+
+// Extra (record-less) folders: deduped, sorted, retrievable.
+assert((await getExtraFolders()).length === 0, 'no extras initially');
+await setExtraFolders(['Projects / Ideas', 'Archive', 'Projects / Ideas']);
+assert((await getExtraFolders()).join('|') === 'Archive|Projects / Ideas', 'extras deduped and sorted');
+
+// Duplicate detection keys on the normalized URL stored at import time.
+const dupA = makeRecord({ title: 'Dup', url: 'https://Example.com/page/?utm_source=x#frag', folder: 'X', dateAdded: 1, source: 'json' });
+const dupB = makeRecord({ title: 'Dup again', url: 'https://example.com/page', folder: 'Y', dateAdded: 2, source: 'json' });
+assert(dupA.normalizedUrl === dupB.normalizedUrl, 'tracking params, fragments, and case unify');
+const distinct = makeRecord({ title: 'Different', url: 'https://example.com/page?id=2', folder: 'Y', dateAdded: 3, source: 'json' });
+assert(distinct.normalizedUrl !== dupA.normalizedUrl, 'meaningful query params stay distinct');
 
 console.log('ops tests: ALL PASS');
 process.exit(0);

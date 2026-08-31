@@ -4,6 +4,7 @@ import EngineWorker from '../lib/worker.ts?worker';
 import type { IndexPhase, WorkerOp, WorkerResponse } from '../lib/worker.ts';
 import {
   db,
+  FOLDER_SEPARATOR,
   getFallbackPage,
   getLibraryStats,
   type BookmarkRecord,
@@ -42,6 +43,15 @@ export type ViewSelection = { view: 'all' | 'folder'; folder: string };
 export type ToastState = {
   message: string;
   undo?: () => void;
+};
+
+export type FaviconState = {
+  running: boolean;
+  done: number;
+  total: number;
+  ok: number;
+  failed: number;
+  message?: string;
 };
 
 type UndoPlan =
@@ -121,6 +131,10 @@ export function useCorral() {
   const [busy, setBusy] = useState(false);
   const [busyLabel, setBusyLabel] = useState('');
   const [toast, setToast] = useState<ToastState | null>(null);
+  const [favicons, setFavicons] = useState<FaviconState | null>(null);
+  const [faviconCount, setFaviconCount] = useState(0);
+  /** Bumped when a favicon pass finishes, so rows re-check the icon cache. */
+  const [iconVersion, setIconVersion] = useState(0);
 
   const workerRef = useRef<Worker | null>(null);
   const searchRequestRef = useRef(0);
@@ -182,6 +196,7 @@ export function useCorral() {
     setStats(nextStats ?? (await getLibraryStats()));
     const sidebar = await runOp<{ folders: FolderCount[]; stale: boolean }>({ kind: 'folders' }).catch(() => ({ folders: [], stale: true }));
     if (!sidebar.stale) setFolders(sidebar.folders);
+    setFaviconCount(await db.favicons.count().catch(() => 0));
     if (navigator.storage?.estimate) {
       const estimate = await navigator.storage.estimate();
       setStorageUsage(estimate.usage ?? 0);
@@ -246,6 +261,13 @@ export function useCorral() {
         pendingOpsRef.current.delete(message.requestId);
         if (message.type === 'op-done') pending.resolve(message.payload);
         else pending.reject(new Error(message.message));
+      }
+      if (message.type === 'favicon-progress') {
+        setFavicons({ running: message.running, done: message.done, total: message.total, ok: message.ok, failed: message.failed, message: message.message });
+        if (!message.running) {
+          setIconVersion((version) => version + 1);
+          void db.favicons.count().then(setFaviconCount).catch(() => undefined);
+        }
       }
       if (message.type === 'fatal') {
         setIndex((current) => ({ ...current, status: 'error', message: message.message }));
@@ -315,11 +337,14 @@ export function useCorral() {
   useEffect(() => {
     if (!deferredQuery) return;
     const requestId = ++searchRequestRef.current;
+    // Search is scoped to the selected folder; picking a folder mid-search
+    // narrows the same query rather than clearing it.
+    const folder = selection.view === 'folder' ? selection.folder : undefined;
     const timer = window.setTimeout(() => {
-      workerRef.current?.postMessage({ type: 'search', requestId, query: deferredQuery, limit: SEARCH_LIMIT });
+      workerRef.current?.postMessage({ type: 'search', requestId, query: deferredQuery, limit: SEARCH_LIMIT, folder });
     }, 30);
     return () => window.clearTimeout(timer);
-  }, [deferredQuery, index.status]);
+  }, [deferredQuery, index.status, selection.folder, selection.view]);
 
   // --- toast --------------------------------------------------------------------
   useEffect(() => {
@@ -366,11 +391,12 @@ export function useCorral() {
   // --- navigation -----------------------------------------------------------------
   const chooseView = useCallback((view: ViewSelection) => {
     dropInFlightPages();
-    updateQuery('');
     setSelection(view);
     setSelected(new Set());
     selectionAnchorRef.current = null;
-  }, [dropInFlightPages, updateQuery]);
+    // An active query stays and re-runs against the new scope.
+    if (lastTrimmedQueryRef.current) setSearch((current) => ({ ...current, pending: true }));
+  }, [dropInFlightPages]);
 
   const changeSort = useCallback((mode: SortMode) => {
     dropInFlightPages();
@@ -572,6 +598,112 @@ export function useCorral() {
     return count;
   }, [runOp]);
 
+  // --- folder management -----------------------------------------------------------
+  /** Keeps a selection inside a relocated subtree pointing at the new path. */
+  const retargetSelection = useCallback((path: string, newPath: string) => {
+    setSelection((current) => {
+      if (current.view !== 'folder') return current;
+      if (current.folder === path || current.folder.startsWith(path + FOLDER_SEPARATOR)) {
+        return { view: 'folder', folder: newPath + current.folder.slice(path.length) };
+      }
+      return current;
+    });
+  }, []);
+
+  const createFolder = useCallback(async (path: string) => {
+    try {
+      const { created } = await runOp<{ created: string }>({ kind: 'create-folder', path });
+      await refreshMetadata();
+      setToast({ message: `Folder “${created}” created` });
+      return created;
+    } catch (error) {
+      setToast({ message: error instanceof Error ? error.message : 'Could not create that folder' });
+      return null;
+    }
+  }, [refreshMetadata, runOp]);
+
+  type RelocatePayload = { moved: number; path: string; newPath: string; priorFolders: Array<{ id: number; folder: string }> };
+
+  const renameFolder = useCallback(async (path: string, newName: string) => {
+    setBusy(true);
+    setBusyLabel(`Renaming ${path}…`);
+    try {
+      const { moved, newPath, priorFolders } = await runOp<RelocatePayload>({ kind: 'rename-folder', path, newName }, setBusyLabel);
+      retargetSelection(path, newPath);
+      await refreshAfterMutation();
+      await refreshMetadata();
+      offerUndo(`Renamed to ${newPath}`, moved > 0 ? { kind: 'folders', moves: priorFolders } : null);
+    } catch (error) {
+      setToast({ message: error instanceof Error ? error.message : 'Could not rename that folder' });
+    } finally {
+      setBusy(false);
+    }
+  }, [offerUndo, refreshAfterMutation, refreshMetadata, retargetSelection, runOp]);
+
+  const moveFolder = useCallback(async (path: string, newParent: string) => {
+    setBusy(true);
+    setBusyLabel(`Moving ${path}…`);
+    try {
+      const { moved, newPath, priorFolders } = await runOp<RelocatePayload>({ kind: 'move-folder', path, newParent }, setBusyLabel);
+      retargetSelection(path, newPath);
+      await refreshAfterMutation();
+      await refreshMetadata();
+      offerUndo(`${path} is now ${newPath}`, moved > 0 ? { kind: 'folders', moves: priorFolders } : null);
+    } catch (error) {
+      setToast({ message: error instanceof Error ? error.message : 'Could not move that folder' });
+    } finally {
+      setBusy(false);
+    }
+  }, [offerUndo, refreshAfterMutation, refreshMetadata, retargetSelection, runOp]);
+
+  const deleteFolder = useCallback(async (path: string) => {
+    try {
+      const { removed } = await runOp<{ removed: string }>({ kind: 'delete-folder', path });
+      setSelection((current) =>
+        current.view === 'folder' && (current.folder === removed || current.folder.startsWith(removed + FOLDER_SEPARATOR))
+          ? { view: 'all', folder: '' }
+          : current,
+      );
+      await refreshMetadata();
+      setToast({ message: `Folder “${removed}” removed` });
+    } catch (error) {
+      setToast({ message: error instanceof Error ? error.message : 'Could not remove that folder' });
+    }
+  }, [refreshMetadata, runOp]);
+
+  // --- duplicates -------------------------------------------------------------------
+  /** Scans the library and returns the ids of every duplicate copy (the oldest
+   * copy of each URL stays); null when the scan failed. */
+  const findDuplicates = useCallback(async () => {
+    setBusy(true);
+    setBusyLabel('Scanning for duplicate links…');
+    try {
+      const { duplicateIds } = await runOp<{ duplicateIds: number[] }>({ kind: 'find-duplicates' }, setBusyLabel);
+      return duplicateIds;
+    } catch (error) {
+      setToast({ message: error instanceof Error ? error.message : 'The duplicate scan failed' });
+      return null;
+    } finally {
+      setBusy(false);
+    }
+  }, [runOp]);
+
+  // --- favicons ----------------------------------------------------------------------
+  const buildFavicons = useCallback(() => {
+    const extension = typeof chrome !== 'undefined' && Boolean(chrome.runtime?.id);
+    // Extension pages read Chrome's own favicon cache; the dev preview goes
+    // through the vite proxy to Google's favicon service.
+    const source = extension
+      ? { mode: 'chrome' as const, prefix: chrome.runtime.getURL('_favicon/') }
+      : { mode: 's2' as const, prefix: '/s2-favicon?sz=32&domain=' };
+    setFavicons({ running: true, done: 0, total: 0, ok: 0, failed: 0 });
+    workerRef.current?.postMessage({ type: 'favicons', source });
+  }, []);
+
+  const stopFavicons = useCallback(() => {
+    workerRef.current?.postMessage({ type: 'favicons-stop' });
+  }, []);
+
   const itemCount = isSearching ? search.ids.length : viewTotal;
 
   return {
@@ -581,6 +713,8 @@ export function useCorral() {
     itemCount, viewTotal, listVersion, loadPage, recordAt,
     selected, setSelected, clickRow, toggleSelected, selectAll, clearSelection,
     moveIds, corralHost, deleteIds, importFromChrome, importFromFile, exportLibrary, hostCount,
+    createFolder, renameFolder, moveFolder, deleteFolder, findDuplicates,
+    favicons, faviconCount, iconVersion, buildFavicons, stopFavicons,
     canUseChrome, busy, busyLabel, toast, setToast,
     requestRebuild: useCallback(() => workerRef.current?.postMessage({ type: 'rebuild' }), []),
   };

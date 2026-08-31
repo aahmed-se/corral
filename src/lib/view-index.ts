@@ -161,6 +161,7 @@ export class ViewIndex {
   private readonly data: ViewIndexData;
   private tombstones = new Set<number>();
   private cache = new Map<string, number[]>();
+  private memberCache = new Map<string, Set<number>>();
 
   constructor(data: ViewIndexData, tombstones?: Iterable<number>) {
     this.data = data;
@@ -170,6 +171,7 @@ export class ViewIndex {
   tombstone(ids: Iterable<number>) {
     for (const id of ids) this.tombstones.add(id);
     this.cache.clear();
+    this.memberCache.clear();
   }
 
   page(query: ViewQuery, offset: number, limit: number): { ids: number[]; total: number } {
@@ -202,6 +204,30 @@ export class ViewIndex {
       if (hostIdOf[index] === hostId && !this.tombstones.has(ids[index]!)) count += 1;
     }
     return count;
+  }
+
+  /** Live record ids inside `folder` (subtree included), as a Set — the
+   * search scope predicate. Cached per folder because it is rebuilt on every
+   * keystroke otherwise. */
+  folderMemberSet(folder: string): Set<number> {
+    const cached = this.memberCache.get(folder);
+    if (cached) return cached;
+    const members = new Set(this.materialize({ view: 'folder', folder, subtree: true, sort: 'oldest' }));
+    if (this.memberCache.size >= VIEW_CACHE_LIMIT) this.memberCache.clear();
+    this.memberCache.set(folder, members);
+    return members;
+  }
+
+  /** Every host with its record count, largest first — the favicon builder's
+   * priority order. Counts reflect the last rebuild. */
+  hosts(): Array<{ host: string; count: number }> {
+    const { hostCounts, hostNames } = this.data;
+    const list: Array<{ host: string; count: number }> = [];
+    for (let id = 0; id < hostNames.length; id += 1) {
+      list.push({ host: hostNames[id]!, count: hostCounts[id]! });
+    }
+    list.sort((left, right) => right.count - left.count);
+    return list;
   }
 
   /** All live record ids on the given host, newest first. */

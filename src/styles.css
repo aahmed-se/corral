@@ -726,3 +726,72 @@ body[data-dragging] * { cursor: grabbing !important; }
   .row-host { display: none; }
   .view-heading h1 { max-width: 60vw; }
 }
+
+/* --- folder management, favicons, dedup ------------------------------------ */
+
+.tree-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 4px 3px 10px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.icon-button.small {
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+}
+.icon-button.small svg { width: 13px; height: 13px; }
+.icon-button:disabled { opacity: 0.45; cursor: default; }
+.icon-button:disabled:hover { background: none; color: var(--text-muted); }
+
+/* The favicon cache line doubles as its own button when idle. */
+button.status-line.action {
+  cursor: pointer;
+  border-radius: 6px;
+  padding: 2px 4px;
+  margin: -2px -4px;
+  text-align: left;
+}
+button.status-line.action:hover:not(:disabled) { background: var(--raised); color: var(--text); }
+button.status-line.action:disabled { opacity: 0.55; cursor: default; }
+button.status-line.action svg { width: 12px; height: 12px; color: var(--accent); flex: none; }
+button.status-line.action span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Cached favicons render on a neutral chip over the letter mark. */
+.site-mark { position: relative; }
+.site-mark img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  padding: 4px;
+  object-fit: contain;
+  border-radius: inherit;
+  box-sizing: border-box;
+}
+.site-mark.has-icon {
+  background: var(--raised);
+  border-color: var(--hairline);
+}
+.site-mark.has-icon .mark-letter { visibility: hidden; }
+.density-compact .site-mark img { padding: 2px; }
+
+.confirm-body {
+  margin: 0;
+  padding: 2px 2px 6px;
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: var(--text-soft);
+}
+
+.drag-ghost { max-width: 340px; }

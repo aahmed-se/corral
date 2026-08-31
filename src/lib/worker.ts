@@ -9,15 +9,19 @@
 import {
   db,
   deleteByIds,
+  FOLDER_SEPARATOR,
   getDirtyRevision,
+  getExtraFolders,
   getFallbackPage,
   getRecordsByIds,
   makeRecord,
   markLibraryDirty,
   moveToFolder,
   sanitizeName,
+  setExtraFolders,
   UNFILED,
   type BookmarkRecord,
+  type FaviconRow,
   type FolderCount,
   type LibraryStats,
   type ShardRow,
@@ -41,6 +45,17 @@ export type WorkerOp =
   /** Undo for a delete: re-inserts the records with their original ids. */
   | { kind: 'restore-records'; records: BookmarkRecord[] }
   | { kind: 'export'; format: 'json' | 'html'; ids?: number[] }
+  /** Registers an empty folder (it exists only in meta until records land). */
+  | { kind: 'create-folder'; path: string }
+  /** Renames a folder in place; every descendant path follows. */
+  | { kind: 'rename-folder'; path: string; newName: string }
+  /** Re-parents a folder (newParent '' = top level); descendants follow. */
+  | { kind: 'move-folder'; path: string; newParent: string }
+  /** Removes a folder that holds no records anywhere in its subtree. */
+  | { kind: 'delete-folder'; path: string }
+  /** Scans for records sharing a normalized URL; returns the ids of every
+   * copy except the oldest, ready for the delete flow. */
+  | { kind: 'find-duplicates' }
   // Read-only:
   | { kind: 'folders' }
   | { kind: 'host-count'; host: string }
@@ -49,12 +64,17 @@ export type WorkerOp =
 
 export type IndexPhase = 'scanning' | 'analyzing' | 'saving';
 
+export type FaviconSource = { mode: 'chrome' | 's2'; prefix: string };
+
 export type WorkerRequest =
   | { type: 'init' }
   | { type: 'rebuild' }
-  | { type: 'search'; requestId: number; query: string; limit: number }
+  /** `folder` scopes matching to that folder's subtree. */
+  | { type: 'search'; requestId: number; query: string; limit: number; folder?: string }
   | { type: 'page'; requestId: number; options: ViewOptions }
-  | { type: 'op'; requestId: number; op: WorkerOp };
+  | { type: 'op'; requestId: number; op: WorkerOp }
+  | { type: 'favicons'; source: FaviconSource }
+  | { type: 'favicons-stop' };
 
 export type WorkerResponse =
   | { type: 'phase'; phase: IndexPhase; done: number; total: number }
@@ -65,6 +85,7 @@ export type WorkerResponse =
   | { type: 'op-progress'; requestId: number; label: string }
   | { type: 'op-done'; requestId: number; payload?: unknown }
   | { type: 'op-error'; requestId: number; message: string }
+  | { type: 'favicon-progress'; done: number; total: number; ok: number; failed: number; running: boolean; message?: string }
   | { type: 'fatal'; message: string };
 
 const scope = self as unknown as {
@@ -227,6 +248,15 @@ async function rebuild() {
     pendingTombstones = [];
     await persistTombstones();
     await db.meta.put(stats);
+    // User-created folders that gained records now live in the scan; keeping
+    // them in the extras list would double them in the sidebar. Transactional,
+    // so a create-folder op landing mid-prune is not lost.
+    await db.transaction('rw', db.meta, async () => {
+      const row = await db.meta.get('extraFolders');
+      const names = row && row.key === 'extraFolders' ? row.names : [];
+      const pruned = names.filter((name) => !folderIds.has(name));
+      if (pruned.length !== names.length) await db.meta.put({ key: 'extraFolders', names: pruned });
+    });
     post({ type: 'ready', stats, restored: false });
   } catch (error) {
     post({ type: 'fatal', message: error instanceof Error ? error.message : 'Indexing failed' });
@@ -243,9 +273,21 @@ function applyTombstones(ids: number[]) {
   else if (serving) void persistTombstones();
 }
 
-function runSearch(requestId: number, query: string, limit: number) {
+function runSearch(requestId: number, query: string, limit: number, folder?: string) {
   const started = performance.now();
-  const result = serving ? serving.search(query, limit) : { ids: [], total: 0, truncated: false };
+  // Folder scope: hand the engine a membership predicate. If the view index
+  // is momentarily rebuilding, an unscoped answer would silently widen the
+  // scope — an empty pending result is less wrong.
+  let accept: ((id: number) => boolean) | undefined;
+  if (folder !== undefined) {
+    if (!servingViews) {
+      post({ type: 'results', requestId, ids: [], total: 0, truncated: false, elapsedMs: 0 });
+      return;
+    }
+    const members = servingViews.folderMemberSet(folder);
+    accept = (id) => members.has(id);
+  }
+  const result = serving ? serving.search(query, limit, accept) : { ids: [], total: 0, truncated: false };
   post({ type: 'results', requestId, ids: result.ids, total: result.total, truncated: result.truncated, elapsedMs: performance.now() - started });
 }
 
@@ -294,6 +336,63 @@ async function moveWithUndo(ids: number[], destination: string, progress: Progre
   await markLibraryDirty();
   const moved = await moveToFolder(ids, destination, (done) => progress(`Moved ${count(done)} of ${count(ids.length)}…`));
   return { moved, priorFolders };
+}
+
+/** Distinct folder paths that are `path` or live under it, per the folder
+ * index — the record-backed half of the tree (extras are checked separately). */
+async function subtreeFolderNames(path: string) {
+  const names = (await db.bookmarks.orderBy('folder').uniqueKeys()) as string[];
+  const prefix = path + FOLDER_SEPARATOR;
+  return names.filter((name) => name === path || name.startsWith(prefix));
+}
+
+/** Rewrites the `path` prefix to `newPath` on every record in the subtree and
+ * on the extras list, returning prior folders for the undo toast. */
+async function relocateFolder(path: string, newPath: string, progress: Progress) {
+  await markLibraryDirty();
+  const affected = await subtreeFolderNames(path);
+  const priorFolders: Array<{ id: number; folder: string }> = [];
+  let moved = 0;
+  for (const name of affected) {
+    const target = newPath + name.slice(path.length);
+    const keys = (await db.bookmarks.where('folder').equals(name).primaryKeys()) as number[];
+    for (let offset = 0; offset < keys.length; offset += 1_000) {
+      const rows = await db.bookmarks.bulkGet(keys.slice(offset, offset + 1_000));
+      const updated: BookmarkRecord[] = [];
+      for (const record of rows) {
+        if (!record) continue;
+        priorFolders.push({ id: record.id!, folder: record.folder });
+        updated.push({ ...record, folder: target });
+      }
+      await db.bookmarks.bulkPut(updated);
+      moved += updated.length;
+      progress(`Moved ${count(moved)}…`);
+      await yieldToQueue();
+    }
+  }
+  const prefix = path + FOLDER_SEPARATOR;
+  const extras = await getExtraFolders();
+  const renamed = extras.map((name) => (name === path || name.startsWith(prefix) ? newPath + name.slice(path.length) : name));
+  // A record-less folder exists only through extras; keep it alive under its
+  // new path even when the old path was implied by children rather than listed.
+  if (moved === 0 && !renamed.includes(newPath)) renamed.push(newPath);
+  await setExtraFolders(renamed);
+  return { moved, priorFolders };
+}
+
+/** Full path → sanitized full path; empty when nothing survives. */
+function sanitizePath(path: string) {
+  return path.split(FOLDER_SEPARATOR).map((part) => sanitizeName(part)).filter(Boolean).join(FOLDER_SEPARATOR);
+}
+
+function parentOf(path: string) {
+  const cut = path.lastIndexOf(FOLDER_SEPARATOR);
+  return cut === -1 ? '' : path.slice(0, cut);
+}
+
+function leafOf(path: string) {
+  const cut = path.lastIndexOf(FOLDER_SEPARATOR);
+  return cut === -1 ? path : path.slice(cut + FOLDER_SEPARATOR.length);
 }
 
 async function runOp(op: WorkerOp, progress: Progress): Promise<OpOutcome> {
@@ -385,8 +484,88 @@ async function runOp(op: WorkerOp, progress: Progress): Promise<OpOutcome> {
     case 'export':
       return exportRecords(op.format, op.ids, progress);
 
+    case 'create-folder': {
+      const path = sanitizePath(op.path);
+      if (!path) throw new Error('Name the folder first.');
+      const known = new Set((servingViews ? servingViews.folders() : []).map((entry) => entry.folder));
+      const extras = await getExtraFolders();
+      if (known.has(path) || extras.includes(path)) throw new Error(`“${path}” already exists.`);
+      await setExtraFolders([...extras, path]);
+      return { payload: { created: path } };
+    }
+
+    case 'rename-folder': {
+      if (op.path === UNFILED) throw new Error(`${UNFILED} is where unfiled bookmarks land — it can't be renamed.`);
+      const leaf = sanitizePath(op.newName);
+      if (!leaf) throw new Error('Name the folder first.');
+      const parent = parentOf(op.path);
+      const newPath = parent ? `${parent}${FOLDER_SEPARATOR}${leaf}` : leaf;
+      if (newPath === op.path) return { payload: { moved: 0, path: op.path, newPath, priorFolders: [] } };
+      const { moved, priorFolders } = await relocateFolder(op.path, newPath, progress);
+      return { payload: { moved, path: op.path, newPath, priorFolders }, rebuild: true, staleViews: true };
+    }
+
+    case 'move-folder': {
+      if (op.path === UNFILED) throw new Error(`${UNFILED} is where unfiled bookmarks land — it can't be moved.`);
+      const newParent = sanitizePath(op.newParent);
+      if (newParent === op.path || newParent.startsWith(op.path + FOLDER_SEPARATOR)) {
+        throw new Error('A folder can’t move into its own subtree.');
+      }
+      const newPath = newParent ? `${newParent}${FOLDER_SEPARATOR}${leafOf(op.path)}` : leafOf(op.path);
+      if (newPath === op.path) return { payload: { moved: 0, path: op.path, newPath, priorFolders: [] } };
+      const { moved, priorFolders } = await relocateFolder(op.path, newPath, progress);
+      return { payload: { moved, path: op.path, newPath, priorFolders }, rebuild: true, staleViews: true };
+    }
+
+    case 'delete-folder': {
+      if (op.path === UNFILED) throw new Error(`${UNFILED} can't be removed.`);
+      const occupied = await subtreeFolderNames(op.path);
+      if (occupied.length > 0) throw new Error('Only empty folders can be removed — move or delete its bookmarks first.');
+      const prefix = op.path + FOLDER_SEPARATOR;
+      const extras = await getExtraFolders();
+      await setExtraFolders(extras.filter((name) => name !== op.path && !name.startsWith(prefix)));
+      return { payload: { removed: op.path } };
+    }
+
+    case 'find-duplicates': {
+      const total = await db.bookmarks.count();
+      // Keyed by the normalized URL computed at import time (tracking params
+      // stripped, host lowercased, fragment dropped). Keeps the oldest copy.
+      const keepers = new Map<string, { id: number; date: number }>();
+      const extras: number[] = [];
+      let scanned = 0;
+      let lastId = 0;
+      for (;;) {
+        const records = await db.bookmarks.where('id').above(lastId).limit(SCAN_CHUNK).toArray();
+        if (records.length === 0) break;
+        lastId = records.at(-1)?.id ?? lastId;
+        for (const record of records) {
+          if (!record.id) continue;
+          const key = record.normalizedUrl || record.url;
+          const best = keepers.get(key);
+          if (!best) {
+            keepers.set(key, { id: record.id, date: record.dateAdded });
+          } else if (record.dateAdded < best.date || (record.dateAdded === best.date && record.id < best.id)) {
+            extras.push(best.id);
+            keepers.set(key, { id: record.id, date: record.dateAdded });
+          } else {
+            extras.push(record.id);
+          }
+        }
+        scanned += records.length;
+        progress(`Checked ${count(scanned)} of ${count(total)}…`);
+        await yieldToQueue();
+      }
+      return { payload: { duplicateIds: extras } };
+    }
+
     case 'folders': {
       const folders: FolderCount[] = servingViews ? servingViews.folders() : [];
+      // User-created folders with no records yet only exist in meta.
+      const known = new Set(folders.map((entry) => entry.folder));
+      for (const name of await getExtraFolders()) {
+        if (!known.has(name)) folders.push({ folder: name, count: 0 });
+      }
       return { payload: { folders, stale: !servingViews } };
     }
 
@@ -467,6 +646,93 @@ function jsonParts(recordParts: string[]) {
   return parts;
 }
 
+// --- favicon cache builder ---------------------------------------------------
+// Runs outside the op chain: it never touches the bookmarks table, only the
+// favicons store. Bumping `faviconRun` cancels the active pass at its next
+// checkpoint; `fetchedAt` makes an interrupted pass resumable.
+
+const FAVICON_FRESH_MS = 30 * 24 * 3_600_000;
+const FAVICON_CONCURRENCY = 12;
+const FAVICON_TIMEOUT_MS = 8_000;
+
+let faviconRun = 0;
+
+function faviconUrl(source: { mode: 'chrome' | 's2'; prefix: string }, host: string) {
+  // chrome: the extension's _favicon endpoint (icons Chrome already has).
+  // s2: a same-origin proxy to Google's favicon service, for the dev preview.
+  return source.mode === 'chrome'
+    ? `${source.prefix}?pageUrl=${encodeURIComponent(`https://${host}/`)}&size=32`
+    : `${source.prefix}${encodeURIComponent(host)}`;
+}
+
+async function fetchFavicon(source: { mode: 'chrome' | 's2'; prefix: string }, host: string): Promise<FaviconRow> {
+  try {
+    // no-store: the blob lands in IndexedDB, so the HTTP cache would only
+    // double-store it — and a cached 301 from the service would otherwise
+    // short-circuit future fetches to a cross-origin hop that dies on CORS.
+    const response = await fetch(faviconUrl(source, host), { signal: AbortSignal.timeout(FAVICON_TIMEOUT_MS), cache: 'no-store' });
+    if (!response.ok) return { host, bytes: null, status: 'missing', fetchedAt: Date.now() };
+    const bytes = await response.blob();
+    if (bytes.size === 0) return { host, bytes: null, status: 'missing', fetchedAt: Date.now() };
+    return { host, bytes, status: 'ok', fetchedAt: Date.now() };
+  } catch {
+    return { host, bytes: null, status: 'error', fetchedAt: Date.now() };
+  }
+}
+
+async function buildFavicons(source: { mode: 'chrome' | 's2'; prefix: string }) {
+  const run = ++faviconRun;
+  const views = servingViews;
+  if (!views) {
+    post({ type: 'favicon-progress', done: 0, total: 0, ok: 0, failed: 0, running: false, message: 'Still indexing — try again in a moment.' });
+    return;
+  }
+
+  // Most-bookmarked hosts first, skipping fresh cache rows and pseudo-hosts
+  // (getBaseHost maps non-http protocols to dotless labels).
+  const now = Date.now();
+  const ranked = views.hosts().filter((entry) => entry.host.includes('.')).map((entry) => entry.host);
+  const pending: string[] = [];
+  for (let offset = 0; offset < ranked.length; offset += INSERT_CHUNK) {
+    const slice = ranked.slice(offset, offset + INSERT_CHUNK);
+    const rows = await db.favicons.bulkGet(slice);
+    for (let index = 0; index < slice.length; index += 1) {
+      const row = rows[index];
+      if (!row || now - row.fetchedAt > FAVICON_FRESH_MS) pending.push(slice[index]!);
+    }
+    if (run !== faviconRun) return;
+    await yieldToQueue();
+  }
+
+  const total = pending.length;
+  let done = 0;
+  let ok = 0;
+  let failed = 0;
+  let lastReport = -1;
+  const report = (running: boolean) => {
+    lastReport = done;
+    post({ type: 'favicon-progress', done, total, ok, failed, running });
+  };
+  report(total > 0);
+
+  for (let offset = 0; offset < pending.length; offset += FAVICON_CONCURRENCY) {
+    if (run !== faviconRun) {
+      report(false);
+      return;
+    }
+    const rows = await Promise.all(pending.slice(offset, offset + FAVICON_CONCURRENCY).map((host) => fetchFavicon(source, host)));
+    for (const row of rows) {
+      if (row.status === 'ok') ok += 1;
+      else failed += 1;
+    }
+    done += rows.length;
+    await db.favicons.bulkPut(rows);
+    if (done - lastReport >= 100) report(true);
+    await yieldToQueue();
+  }
+  report(false);
+}
+
 const READ_ONLY_OPS = new Set(['folders', 'host-count', 'view-ids', 'view-total']);
 
 /** Mutating ops run strictly serialized — a delete interleaving with a
@@ -503,7 +769,9 @@ scope.onmessage = (event) => {
   const message = event.data;
   if (message.type === 'init') void boot().catch(reportFatal);
   if (message.type === 'rebuild') void rebuild();
-  if (message.type === 'search') runSearch(message.requestId, message.query, message.limit);
+  if (message.type === 'search') runSearch(message.requestId, message.query, message.limit, message.folder);
   if (message.type === 'page') void readPage(message.requestId, message.options);
   if (message.type === 'op') handleOp(message.requestId, message.op);
+  if (message.type === 'favicons') void buildFavicons(message.source);
+  if (message.type === 'favicons-stop') faviconRun += 1;
 };

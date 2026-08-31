@@ -2,9 +2,15 @@ import { useCallback, useMemo, useRef, useState, type PointerEvent as ReactPoint
 import {
   AlignJustify,
   Copy,
+  CopyMinus,
+  CornerLeftUp,
   Download,
   ExternalLink,
+  Folder,
   FolderInput,
+  FolderPen,
+  FolderPlus,
+  ImageDown,
   Lasso,
   List,
   Loader2,
@@ -17,19 +23,25 @@ import {
   X,
   Zap,
 } from 'lucide-react';
-import { db, type BookmarkRecord, type SortMode } from './lib/db.ts';
+import { db, FOLDER_SEPARATOR, UNFILED, type BookmarkRecord, type SortMode } from './lib/db.ts';
 import { BookmarkList } from './ui/bookmark-list.tsx';
 import { ContextMenu, type MenuItem } from './ui/context-menu.tsx';
-import { ExportDialog, FolderPickerDialog, ImportDialog } from './ui/dialogs.tsx';
-import { FolderTree, springExpand } from './ui/folder-tree.tsx';
-import { countLabel, useCorral, type Density } from './ui/use-corral.ts';
-import { useDrag } from './ui/use-drag.ts';
+import { ConfirmDialog, ExportDialog, FolderPickerDialog, ImportDialog, NameDialog } from './ui/dialogs.tsx';
+import { FolderTree, springExpand, type TreeNode } from './ui/folder-tree.tsx';
+import { countLabel, useCorral, type Corral, type Density } from './ui/use-corral.ts';
+import { useDrag, type DragPayload } from './ui/use-drag.ts';
 
 type PickerIntent =
   | { kind: 'move'; ids: number[]; label: string }
   | { kind: 'corral'; host: string; count: number };
 
 type MenuState = { x: number; y: number; record: BookmarkRecord; targetIds: number[] };
+
+type FolderMenuState = { x: number; y: number; node: TreeNode };
+
+type NameIntent =
+  | { kind: 'create'; parent: string }
+  | { kind: 'rename'; path: string; initial: string };
 
 const DENSITIES: Array<{ id: Density; label: string; icon: React.ReactNode }> = [
   { id: 'roomy', label: 'Roomy rows', icon: <Rows3 /> },
@@ -47,20 +59,52 @@ export function App() {
   const corral = useCorral();
   const [menu, setMenu] = useState<MenuState | null>(null);
   const [menuHostCount, setMenuHostCount] = useState<number | null>(null);
+  const [folderMenu, setFolderMenu] = useState<FolderMenuState | null>(null);
   const [picker, setPicker] = useState<PickerIntent | null>(null);
+  const [nameIntent, setNameIntent] = useState<NameIntent | null>(null);
+  const [dedupIds, setDedupIds] = useState<number[] | null>(null);
   const [importOpen, setImportOpen] = useState(false);
   const [exportOpen, setExportOpen] = useState(false);
   const searchRef = useRef<HTMLInputElement>(null);
 
-  const { drag, beginFromRow } = useDrag({
+  const { drag, beginFromRow, beginFromFolder } = useDrag({
     dragIdsFor: useCallback((rowId: number) => (corral.selected.has(rowId) ? Array.from(corral.selected) : [rowId]), [corral.selected]),
-    onDrop: useCallback((ids: number[], folder: string) => void corral.moveIds(ids, folder), [corral.moveIds]),
+    onDrop: useCallback((payload: DragPayload, folder: string) => {
+      if (payload.kind === 'rows') {
+        // Dropping rows on "All bookmarks" unfiles them.
+        void corral.moveIds(payload.ids, folder === '' ? UNFILED : folder);
+        return;
+      }
+      const parent = payload.path.includes(FOLDER_SEPARATOR) ? payload.path.slice(0, payload.path.lastIndexOf(FOLDER_SEPARATOR)) : '';
+      // Silently ignore drops that change nothing or would nest a folder
+      // inside itself; the worker guards too, but these deserve no error toast.
+      if (folder === payload.path || folder === parent || folder.startsWith(payload.path + FOLDER_SEPARATOR)) return;
+      void corral.moveFolder(payload.path, folder);
+    }, [corral.moveIds, corral.moveFolder]),
     onSpringExpand: springExpand,
   });
 
   const onRowPointerDown = useCallback((event: ReactPointerEvent, record: BookmarkRecord) => {
     if (record.id) beginFromRow(event, record.id);
   }, [beginFromRow]);
+
+  const onFolderPointerDown = useCallback((event: ReactPointerEvent, path: string) => {
+    if (path !== UNFILED) beginFromFolder(event, path);
+  }, [beginFromFolder]);
+
+  const onFolderContextMenu = useCallback((event: React.MouseEvent, node: TreeNode) => {
+    setFolderMenu({ x: event.clientX, y: event.clientY, node });
+  }, []);
+
+  const runDedup = useCallback(async () => {
+    const ids = await corral.findDuplicates();
+    if (!ids) return;
+    if (ids.length === 0) {
+      corral.setToast({ message: 'No duplicate links found' });
+      return;
+    }
+    setDedupIds(ids);
+  }, [corral]);
 
   const onRowContextMenu = useCallback((event: React.MouseEvent, record: BookmarkRecord) => {
     event.preventDefault();
@@ -101,6 +145,24 @@ export function App() {
     ];
   }, [corral, menu, menuHostCount]);
 
+  const folderMenuItems: MenuItem[] = useMemo(() => {
+    if (!folderMenu) return [];
+    const { node } = folderMenu;
+    const items: MenuItem[] = [
+      { kind: 'item', label: 'New subfolder…', icon: <FolderPlus />, onSelect: () => setNameIntent({ kind: 'create', parent: node.path }) },
+    ];
+    if (node.path !== UNFILED) {
+      items.push({ kind: 'item', label: 'Rename…', icon: <FolderPen />, onSelect: () => setNameIntent({ kind: 'rename', path: node.path, initial: node.name }) });
+      if (node.path.includes(FOLDER_SEPARATOR)) {
+        items.push({ kind: 'item', label: 'Move to top level', icon: <CornerLeftUp />, onSelect: () => void corral.moveFolder(node.path, '') });
+      }
+      if (node.total === 0) {
+        items.push({ kind: 'separator' }, { kind: 'item', label: 'Remove folder', icon: <Trash2 />, danger: true, onSelect: () => void corral.deleteFolder(node.path) });
+      }
+    }
+    return items;
+  }, [corral, folderMenu]);
+
   const sortLabel: Record<SortMode, string> = { newest: 'Newest', oldest: 'Oldest', title: 'Title A–Z', site: 'By site' };
 
   const heading = corral.isSearching
@@ -108,10 +170,11 @@ export function App() {
     : corral.selection.view === 'all'
       ? 'All bookmarks'
       : corral.selection.folder;
+  const searchScope = corral.isSearching && corral.selection.view === 'folder' ? ` · in ${corral.selection.folder}` : '';
   const subtitle = corral.isSearching
     ? corral.search.pending
-      ? 'Searching…'
-      : `${corral.search.total.toLocaleString()} matches in ${corral.search.elapsedMs < 1 ? '<1' : corral.search.elapsedMs.toFixed(1)} ms${corral.search.truncated ? ' · top results' : ''}`
+      ? `Searching…${searchScope}`
+      : `${corral.search.total.toLocaleString()} matches in ${corral.search.elapsedMs < 1 ? '<1' : corral.search.elapsedMs.toFixed(1)} ms${corral.search.truncated ? ' · top results' : ''}${searchScope}`
     : countLabel(corral.viewTotal, 'link');
 
   return (
@@ -127,9 +190,13 @@ export function App() {
           selection={corral.selection}
           onSelect={corral.chooseView}
           drag={drag}
+          onNewFolder={() => setNameIntent({ kind: 'create', parent: '' })}
+          onFolderContextMenu={onFolderContextMenu}
+          onFolderPointerDown={onFolderPointerDown}
         />
         <div className="side-status">
           <StatusLine corral={corral} />
+          <FaviconLine corral={corral} />
           <div className="side-meta">
             <span>{formatBytes(corral.storageUsage)} on device</span>
             <span>Local only</span>
@@ -182,6 +249,15 @@ export function App() {
                 <option key={mode} value={mode}>{sortLabel[mode]}</option>
               ))}
             </select>
+            <button
+              className="icon-button"
+              title="Remove duplicate links"
+              aria-label="Remove duplicate links"
+              disabled={corral.busy || corral.stats.total === 0}
+              onClick={() => void runDedup()}
+            >
+              <CopyMinus />
+            </button>
             <button className="icon-button" title="Export" aria-label="Export" onClick={() => setExportOpen(true)}><Download /></button>
             <button className="button primary" onClick={() => setImportOpen(true)}><Plus /> Import</button>
           </div>
@@ -214,13 +290,14 @@ export function App() {
 
       {drag && (
         <div className="drag-ghost" style={{ transform: `translate(${drag.x + 14}px, ${drag.y + 10}px)` }}>
-          <Menu />
-          {countLabel(drag.ids.length)}
-          {drag.overFolder !== null && <span className="drag-target">→ {drag.overFolder === '' ? 'All bookmarks' : drag.overFolder}</span>}
+          {drag.payload.kind === 'rows' ? <Menu /> : <Folder />}
+          {drag.payload.kind === 'rows' ? countLabel(drag.payload.ids.length) : drag.payload.path}
+          {drag.overFolder !== null && <span className="drag-target">→ {drag.overFolder === '' ? (drag.payload.kind === 'rows' ? UNFILED : 'Top level') : drag.overFolder}</span>}
         </div>
       )}
 
       {menu && <ContextMenu x={menu.x} y={menu.y} items={menuItems} onClose={() => setMenu(null)} />}
+      {folderMenu && <ContextMenu x={folderMenu.x} y={folderMenu.y} items={folderMenuItems} onClose={() => setFolderMenu(null)} />}
 
       {picker && (
         <FolderPickerDialog
@@ -234,6 +311,35 @@ export function App() {
             else void corral.moveIds(picker.ids, destination);
           }}
           onClose={() => setPicker(null)}
+        />
+      )}
+
+      {nameIntent && (
+        <NameDialog
+          title={nameIntent.kind === 'create' ? (nameIntent.parent ? `New folder in ${nameIntent.parent}` : 'New folder') : `Rename ${nameIntent.path}`}
+          subtitle={nameIntent.kind === 'create' ? `Use “${FOLDER_SEPARATOR.trim()}” in the name to nest deeper.` : undefined}
+          initial={nameIntent.kind === 'rename' ? nameIntent.initial : ''}
+          placeholder="Folder name"
+          confirmLabel={nameIntent.kind === 'create' ? 'Create' : 'Rename'}
+          onSubmit={(name) => {
+            if (nameIntent.kind === 'create') {
+              void corral.createFolder(nameIntent.parent ? `${nameIntent.parent}${FOLDER_SEPARATOR}${name}` : name);
+            } else {
+              void corral.renameFolder(nameIntent.path, name);
+            }
+          }}
+          onClose={() => setNameIntent(null)}
+        />
+      )}
+
+      {dedupIds && (
+        <ConfirmDialog
+          title="Remove duplicate links"
+          body={`${countLabel(dedupIds.length)} share${dedupIds.length === 1 ? 's' : ''} a URL with an older copy. Remove ${dedupIds.length === 1 ? 'it' : 'them'}? The oldest copy of each link stays, and Undo will be offered.`}
+          confirmLabel={`Remove ${countLabel(dedupIds.length)}`}
+          danger
+          onConfirm={() => void corral.deleteIds(dedupIds)}
+          onClose={() => setDedupIds(null)}
         />
       )}
 
@@ -266,6 +372,39 @@ export function App() {
         </output>
       )}
     </div>
+  );
+}
+
+/** Site-icon cache control: idle it is a build/refresh button, running it is
+ * a progress meter with a stop control. */
+function FaviconLine({ corral }: { corral: Corral }) {
+  const { favicons, faviconCount } = corral;
+  if (favicons?.running) {
+    const share = favicons.total > 0 ? Math.round((favicons.done / favicons.total) * 100) : 0;
+    return (
+      <div className="status-line">
+        <Loader2 className="spin" />
+        <span>Site icons · {favicons.total > 0 ? `${share}%` : 'checking cache…'}</span>
+        <span className="status-meter"><i style={{ width: `${share}%` }} /></span>
+        <button className="icon-button small" title="Stop" aria-label="Stop fetching site icons" onClick={corral.stopFavicons}><X /></button>
+      </div>
+    );
+  }
+  const idleLabel = favicons && favicons.message
+    ? favicons.message
+    : faviconCount > 0
+      ? `Refresh site icons · ${faviconCount.toLocaleString()} cached`
+      : 'Build site icon cache';
+  return (
+    <button
+      className="status-line action"
+      disabled={corral.index.status !== 'ready' || corral.stats.total === 0}
+      title="Fetch favicons for every bookmarked site"
+      onClick={corral.buildFavicons}
+    >
+      <ImageDown />
+      <span>{idleLabel}</span>
+    </button>
   );
 }
 

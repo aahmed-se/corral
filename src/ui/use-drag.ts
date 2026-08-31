@@ -9,8 +9,12 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 // image reliably, fights with virtualized lists, and offers no control over
 // auto-scroll or spring-loaded folder expansion.
 
+export type DragPayload =
+  | { kind: 'rows'; ids: number[] }
+  | { kind: 'folder'; path: string };
+
 export type DragState = {
-  ids: number[];
+  payload: DragPayload;
   x: number;
   y: number;
   overFolder: string | null;
@@ -21,12 +25,12 @@ const SPRING_EXPAND_MS = 550;
 const AUTO_SCROLL_EDGE_PX = 48;
 const AUTO_SCROLL_MAX_STEP = 18;
 
-type PendingDrag = { startX: number; startY: number; rowId: number; pointerId: number };
+type PendingDrag = { startX: number; startY: number; payloadFor: () => DragPayload | null; pointerId: number };
 
 export function useDrag(options: {
   /** ids to drag when a drag starts from this row. */
   dragIdsFor: (rowId: number) => number[];
-  onDrop: (ids: number[], folder: string) => void;
+  onDrop: (payload: DragPayload, folder: string) => void;
   /** Called when the pointer dwells on a collapsed folder mid-drag. */
   onSpringExpand: (folder: string) => void;
 }) {
@@ -54,7 +58,7 @@ export function useDrag(options: {
     document.body.removeAttribute('data-dragging');
     setDrag(null);
     if (commit && current && current.overFolder !== null) {
-      optionsRef.current.onDrop(current.ids, current.overFolder);
+      optionsRef.current.onDrop(current.payload, current.overFolder);
     }
   }, []);
 
@@ -63,12 +67,12 @@ export function useDrag(options: {
       const pending = pendingRef.current;
       if (pending && !dragRef.current) {
         if (Math.hypot(event.clientX - pending.startX, event.clientY - pending.startY) < DRAG_THRESHOLD_PX) return;
-        const ids = optionsRef.current.dragIdsFor(pending.rowId);
-        if (ids.length === 0) {
+        const payload = pending.payloadFor();
+        if (!payload || (payload.kind === 'rows' && payload.ids.length === 0)) {
           pendingRef.current = null;
           return;
         }
-        dragRef.current = { ids, x: event.clientX, y: event.clientY, overFolder: null };
+        dragRef.current = { payload, x: event.clientX, y: event.clientY, overFolder: null };
         document.body.setAttribute('data-dragging', 'true');
         setDrag(dragRef.current);
       }
@@ -131,14 +135,23 @@ export function useDrag(options: {
     };
   }, [finish]);
 
-  /** Attach to a row's onPointerDown to make it draggable. */
-  const beginFromRow = useCallback((event: React.PointerEvent, rowId: number) => {
+  const begin = useCallback((event: React.PointerEvent, payloadFor: () => DragPayload | null) => {
     if (event.button !== 0) return;
     const element = event.target as HTMLElement;
     // Interactive children keep their own behavior.
     if (element.closest('button, a, input, select, textarea')) return;
-    pendingRef.current = { startX: event.clientX, startY: event.clientY, rowId, pointerId: event.pointerId };
+    pendingRef.current = { startX: event.clientX, startY: event.clientY, payloadFor, pointerId: event.pointerId };
   }, []);
 
-  return { drag, beginFromRow };
+  /** Attach to a row's onPointerDown to make it draggable. */
+  const beginFromRow = useCallback((event: React.PointerEvent, rowId: number) => {
+    begin(event, () => ({ kind: 'rows', ids: optionsRef.current.dragIdsFor(rowId) }));
+  }, [begin]);
+
+  /** Attach to a folder tree row's onPointerDown to make the folder draggable. */
+  const beginFromFolder = useCallback((event: React.PointerEvent, path: string) => {
+    begin(event, () => ({ kind: 'folder', path }));
+  }, [begin]);
+
+  return { drag, beginFromRow, beginFromFolder };
 }

@@ -83,4 +83,44 @@ delete missing.hostCounts;
 assert(deserializeViewData(missing) === null, 'missing counts rejected');
 assert(deserializeViewData(undefined) === null, 'absent row rejected');
 
+// --- scoped search (accept predicate) ------------------------------------------
+const sb2 = new ShardBuilder();
+sb2.add({ id: 11, title: 'GitHub home', url: 'https://github.com/', host: 'github.com', folder: 'Dev' });
+sb2.add({ id: 12, title: 'GitHub docs', url: 'https://docs.github.com/', host: 'docs.github.com', folder: 'Dev / Docs' });
+sb2.add({ id: 13, title: 'GitHub blog', url: 'https://github.blog/', host: 'github.blog', folder: 'News' });
+const scopedStore = ShardStore.fromShards(sb2.finish());
+assert(scopedStore.search('github', 10).total === 3, 'unscoped finds all');
+const devMembers = new Set([11, 12]);
+const scoped = scopedStore.search('github', 10, (id) => devMembers.has(id));
+assert(scoped.ids.length === 2 && scoped.total === 2 && !scoped.ids.includes(13), 'scope filters matches');
+const none = scopedStore.search('github', 10, () => false);
+assert(none.ids.length === 0 && none.total === 0 && none.truncated === false, 'empty scope');
+
+// The predicate runs inside the match loop, so a tiny folder is reachable even
+// when a common term would truncate the unscoped scan before its shard.
+const sb3 = new ShardBuilder();
+sb3.add({ id: 90001, title: 'Common treasure', url: 'https://rare.example/x', host: 'rare.example', folder: 'Tiny' });
+for (let i = 1; i <= 30000; i += 1) {
+  sb3.add({ id: i, title: `Common page ${i}`, url: `https://common.example/${i}`, host: 'common.example', folder: 'Noise' });
+}
+const bigStore = ShardStore.fromShards(sb3.finish());
+const unscopedBig = bigStore.search('common', 50);
+assert(unscopedBig.truncated && !unscopedBig.ids.includes(90001), 'sanity: unscoped scan truncates before the oldest shard');
+const tinyScope = bigStore.search('common', 50, (id) => id === 90001);
+assert(tinyScope.ids.join(',') === '90001' && tinyScope.total === 1, 'small scope survives a common term');
+
+// --- folder membership sets + host ranking --------------------------------------
+const vbm = new ViewIndexBuilder();
+vbm.add(1, 10, 'A', 0, 0); // Work
+vbm.add(2, 20, 'B', 1, 0); // Work / Deep
+vbm.add(3, 30, 'C', 2, 1); // Play
+const memberIndex = new ViewIndex(vbm.finish(['Work', 'Work / Deep', 'Play'], ['a.com', 'b.com']));
+assert([...memberIndex.folderMemberSet('Work')].sort().join(',') === '1,2', 'membership includes subtree');
+assert(memberIndex.folderMemberSet('Play').has(3) && memberIndex.folderMemberSet('Play').size === 1, 'membership exact folder');
+assert(memberIndex.folderMemberSet('Nope').size === 0, 'membership unknown folder');
+memberIndex.tombstone([2]);
+assert(memberIndex.folderMemberSet('Work').size === 1, 'tombstone shrinks membership');
+const rankedHosts = memberIndex.hosts();
+assert(rankedHosts[0].host === 'a.com' && rankedHosts[0].count === 2, 'hosts ranked by count');
+
 console.log('engine tests: ALL PASS');

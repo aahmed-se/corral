@@ -113,6 +113,83 @@ export function FolderPickerDialog({ title, subtitle, folders, suggested, confir
   );
 }
 
+/** Single-field dialog for naming things: new folders, renames. */
+export function NameDialog({ title, subtitle, initial, placeholder, confirmLabel, onSubmit, onClose }: {
+  title: string;
+  subtitle?: string;
+  initial?: string;
+  placeholder?: string;
+  confirmLabel: string;
+  onSubmit: (name: string) => void;
+  onClose: () => void;
+}) {
+  const [value, setValue] = useState(initial ?? '');
+  const inputRef = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    inputRef.current?.focus();
+    inputRef.current?.select();
+  }, []);
+
+  return (
+    <Dialog title={title} subtitle={subtitle} onClose={onClose}>
+      <form
+        className="picker"
+        onSubmit={(event) => {
+          event.preventDefault();
+          const trimmed = value.trim();
+          if (!trimmed) return;
+          onClose();
+          onSubmit(trimmed);
+        }}
+      >
+        <input
+          ref={inputRef}
+          className="picker-input"
+          value={value}
+          onChange={(event) => setValue(event.target.value)}
+          placeholder={placeholder}
+          spellCheck={false}
+          autoComplete="off"
+        />
+        <footer className="dialog-footer">
+          <button type="button" className="button ghost" onClick={onClose}>Cancel</button>
+          <button type="submit" className="button primary" disabled={!value.trim()}>{confirmLabel}</button>
+        </footer>
+      </form>
+    </Dialog>
+  );
+}
+
+/** Yes/no gate for destructive bulk actions. */
+export function ConfirmDialog({ title, body, confirmLabel, danger, onConfirm, onClose }: {
+  title: string;
+  body: string;
+  confirmLabel: string;
+  danger?: boolean;
+  onConfirm: () => void;
+  onClose: () => void;
+}) {
+  return (
+    <Dialog title={title} onClose={onClose}>
+      <p className="confirm-body">{body}</p>
+      <footer className="dialog-footer">
+        <button type="button" className="button ghost" onClick={onClose}>Cancel</button>
+        <button
+          type="button"
+          className={`button ${danger ? 'danger' : 'primary'}`}
+          autoFocus
+          onClick={() => {
+            onClose();
+            onConfirm();
+          }}
+        >
+          {confirmLabel}
+        </button>
+      </footer>
+    </Dialog>
+  );
+}
+
 export function ImportDialog({ canUseChrome, busy, onChrome, onFile, onClose }: {
   canUseChrome: boolean;
   busy: boolean;

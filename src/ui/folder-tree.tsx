@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useState } from 'react';
-import { ChevronRight, Folder, FolderOpen, Inbox, Library } from 'lucide-react';
+import { useEffect, useMemo, useState, type PointerEvent as ReactPointerEvent } from 'react';
+import { ChevronRight, Folder, FolderOpen, FolderPlus, Inbox, Library } from 'lucide-react';
 import { FOLDER_SEPARATOR, UNFILED, type FolderCount } from '../lib/db.ts';
 import type { DragState } from './use-drag.ts';
 import type { ViewSelection } from './use-corral.ts';
@@ -60,12 +60,15 @@ function formatCount(count: number) {
 
 const EXPANDED_KEY = 'corral-expanded';
 
-export function FolderTree({ folders, total, selection, onSelect, drag }: {
+export function FolderTree({ folders, total, selection, onSelect, drag, onNewFolder, onFolderContextMenu, onFolderPointerDown }: {
   folders: FolderCount[];
   total: number;
   selection: ViewSelection;
   onSelect: (view: ViewSelection) => void;
   drag: DragState | null;
+  onNewFolder: () => void;
+  onFolderContextMenu: (event: React.MouseEvent, node: TreeNode) => void;
+  onFolderPointerDown: (event: ReactPointerEvent, path: string) => void;
 }) {
   const tree = useMemo(() => buildTree(folders), [folders]);
   const [expanded, setExpanded] = useState<Set<string>>(() => {
@@ -120,6 +123,11 @@ export function FolderTree({ folders, total, selection, onSelect, drag }: {
           aria-selected={isActive}
           tabIndex={0}
           onClick={() => onSelect({ view: 'folder', folder: node.path })}
+          onContextMenu={(event) => {
+            event.preventDefault();
+            onFolderContextMenu(event, node);
+          }}
+          onPointerDown={(event) => onFolderPointerDown(event, node.path)}
           onKeyDown={(event) => {
             if (event.key === 'Enter') onSelect({ view: 'folder', folder: node.path });
             if (event.key === 'ArrowRight' && hasChildren && !isExpanded) toggle(node.path);
@@ -147,13 +155,15 @@ export function FolderTree({ folders, total, selection, onSelect, drag }: {
   };
 
   const allActive = selection.view === 'all';
+  const allDropTarget = drag !== null && drag.overFolder === '';
   return (
     <nav className="folder-tree" aria-label="Folders" role="tree" data-drag-scroll="true">
       <div
-        className={`tree-row all-row${allActive ? ' active' : ''}`}
+        className={`tree-row all-row${allActive ? ' active' : ''}${allDropTarget ? ' drop-target' : ''}`}
         role="treeitem"
         aria-selected={allActive}
         tabIndex={0}
+        data-drop-folder=""
         onClick={() => onSelect({ view: 'all', folder: '' })}
         onKeyDown={(event) => {
           if (event.key === 'Enter') onSelect({ view: 'all', folder: '' });
@@ -163,6 +173,12 @@ export function FolderTree({ folders, total, selection, onSelect, drag }: {
         <Library className="tree-icon" />
         <span className="tree-name">All bookmarks</span>
         <span className="tree-count">{formatCount(total)}</span>
+      </div>
+      <div className="tree-head">
+        <span>Folders</span>
+        <button className="icon-button small" title="New folder" aria-label="New folder" onClick={onNewFolder}>
+          <FolderPlus />
+        </button>
       </div>
       {tree.map((node) => renderNode(node, 0))}
     </nav>

@@ -56,7 +56,23 @@ export type DirtyRow = {
   revision: number;
 };
 
-export type MetaRow = LibraryStats | TombstoneRow | DirtyRow;
+/** Folders the user created that hold no records yet — they exist only here
+ * until a bookmark lands in them. */
+export type ExtraFoldersRow = {
+  key: 'extraFolders';
+  names: string[];
+};
+
+export type MetaRow = LibraryStats | TombstoneRow | DirtyRow | ExtraFoldersRow;
+
+/** Per-host favicon/metadata cache. `bytes` is null when the fetch failed or
+ * the host has no icon; `fetchedAt` makes the builder resumable. */
+export type FaviconRow = {
+  host: string;
+  bytes: Blob | null;
+  status: 'ok' | 'missing' | 'error';
+  fetchedAt: number;
+};
 
 export type ShardRow = {
   seq: number;
@@ -76,6 +92,7 @@ class CorralDatabase extends Dexie {
   meta!: Table<MetaRow, string>;
   searchShards!: Table<ShardRow, number>;
   viewData!: Table<ViewDataRow, number>;
+  favicons!: Table<FaviconRow, string>;
 
   constructor() {
     super('corral');
@@ -87,6 +104,10 @@ class CorralDatabase extends Dexie {
       meta: '&key',
       searchShards: '&seq, revision',
       viewData: '&revision',
+    });
+    // v2: per-host favicon cache.
+    this.version(2).stores({
+      favicons: '&host, fetchedAt',
     });
   }
 }
@@ -236,6 +257,15 @@ export async function moveToFolder(ids: number[], folder: string, onProgress?: (
     await yieldToQueue();
   }
   return moved;
+}
+
+export async function getExtraFolders(): Promise<string[]> {
+  const row = await db.meta.get('extraFolders');
+  return row && row.key === 'extraFolders' ? row.names : [];
+}
+
+export async function setExtraFolders(names: string[]) {
+  await db.meta.put({ key: 'extraFolders', names: Array.from(new Set(names)).sort() });
 }
 
 export async function deleteByIds(ids: number[], onProgress?: (deleted: number) => void) {

@@ -1,7 +1,7 @@
-import { useCallback, useEffect, useMemo, useRef, type CSSProperties, type PointerEvent as ReactPointerEvent } from 'react';
+import { useCallback, useEffect, useMemo, useReducer, useRef, type CSSProperties, type PointerEvent as ReactPointerEvent } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { CheckSquare, Square } from 'lucide-react';
-import type { BookmarkRecord } from '../lib/db.ts';
+import { db, type BookmarkRecord } from '../lib/db.ts';
 import { PAGE_SIZE, type Corral, type Density } from './use-corral.ts';
 
 const ROW_HEIGHT: Record<Density, number> = { roomy: 62, cozy: 42, compact: 28 };
@@ -16,12 +16,29 @@ function formatDate(timestamp: number) {
   return dateYearFormatter.format(then);
 }
 
+// Object URLs for cached favicons, keyed by host. Module-level so scrolling
+// back over rows never re-reads IndexedDB; null marks "looked up, none stored"
+// so the letter mark renders without retrying every page.
+const iconUrls = new Map<string, string | null>();
+const iconLookups = new Set<string>();
+
 function SiteMark({ host }: { host: string }) {
   let hue = 0;
   for (let index = 0; index < host.length; index += 1) hue = (hue * 31 + host.charCodeAt(index)) % 360;
+  const iconUrl = iconUrls.get(host);
   return (
-    <span className="site-mark" style={{ '--hue': hue } as CSSProperties} aria-hidden="true">
-      {host.charAt(0).toUpperCase() || '?'}
+    <span className={`site-mark${iconUrl ? ' has-icon' : ''}`} style={{ '--hue': hue } as CSSProperties} aria-hidden="true">
+      <span className="mark-letter">{host.charAt(0).toUpperCase() || '?'}</span>
+      {iconUrl && (
+        <img
+          src={iconUrl}
+          alt=""
+          onError={(event) => {
+            iconUrls.set(host, null);
+            event.currentTarget.style.display = 'none';
+          }}
+        />
+      )}
     </span>
   );
 }
@@ -57,6 +74,48 @@ export function BookmarkList({ corral, onRowPointerDown, onRowContextMenu, onImp
     if (!pageSignature) return;
     for (const page of pageSignature.split(',').map(Number)) loadPage(page, isSearching);
   }, [isSearching, listVersion, loadPage, pageSignature, corral.search.ids]);
+
+  // --- favicons: resolve icons for the hosts currently on screen ---------------
+  const [, bumpIcons] = useReducer((tick: number) => tick + 1, 0);
+
+  // A finished favicon build invalidates everything already resolved.
+  useEffect(() => {
+    if (corral.iconVersion === 0) return;
+    for (const url of iconUrls.values()) if (url) URL.revokeObjectURL(url);
+    iconUrls.clear();
+    iconLookups.clear();
+    bumpIcons();
+  }, [corral.iconVersion]);
+
+  const visibleHosts = useMemo(() => {
+    const hosts = new Set<string>();
+    for (const row of virtualRows) {
+      const record = recordAt(row.index);
+      if (record) hosts.add(record.host);
+    }
+    return Array.from(hosts);
+  }, [recordAt, virtualRows]);
+
+  useEffect(() => {
+    const missing = visibleHosts.filter((host) => !iconUrls.has(host) && !iconLookups.has(host));
+    if (missing.length === 0) return;
+    for (const host of missing) iconLookups.add(host);
+    void db.favicons
+      .bulkGet(missing)
+      .then((rows) => {
+        rows.forEach((row, index) => {
+          const host = missing[index]!;
+          iconLookups.delete(host);
+          iconUrls.set(host, row?.bytes ? URL.createObjectURL(row.bytes) : null);
+        });
+        bumpIcons();
+      })
+      .catch(() => {
+        for (const host of missing) iconLookups.delete(host);
+      });
+    // iconVersion: a finished build clears the cache (effect above), and the
+    // hosts on screen — unchanged by that — must be looked up again.
+  }, [visibleHosts, corral.iconVersion]);
 
   const openRecord = useCallback((record: BookmarkRecord) => {
     window.open(record.url, '_blank', 'noopener,noreferrer');

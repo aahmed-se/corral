@@ -137,7 +137,10 @@ export class ShardStore {
     for (const id of ids) this.tombstones.add(id);
   }
 
-  search(query: string, limit: number): SearchResult {
+  /** `accept` scopes the search (e.g. to one folder's ids). It runs inside the
+   * match loop, so a scoped query ranks and counts only in-scope records —
+   * filtering the top-N afterwards would starve small scopes on common terms. */
+  search(query: string, limit: number, accept?: (id: number) => boolean): SearchResult {
     const terms = parseQuery(query);
     if (terms.length === 0) return { ids: [], total: 0, truncated: false };
 
@@ -170,7 +173,7 @@ export class ShardStore {
         const end = starts[recordIndex + 1]! - RECORD_SEP.length;
         const id = ids[recordIndex]!;
 
-        if (!this.tombstones.has(id)) {
+        if (!this.tombstones.has(id) && (!accept || accept(id))) {
           const record = text.slice(start, end);
           let matchesAll = true;
           for (const term of rest) {
