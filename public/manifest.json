@@ -5,12 +5,24 @@
   "version": "0.1.0",
   "description": "Round up your bookmarks: folder-first organizing, instant search, and drag-and-drop at any scale. Everything stays on this device.",
   "permissions": ["bookmarks", "storage", "unlimitedStorage"],
+  "icons": {
+    "16": "icons/icon-16.png",
+    "32": "icons/icon-32.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  },
   "background": {
     "service_worker": "background.js",
     "type": "module"
   },
   "action": {
-    "default_title": "Open Corral"
+    "default_title": "Open Corral",
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "32": "icons/icon-32.png",
+      "48": "icons/icon-48.png",
+      "128": "icons/icon-128.png"
+    }
   },
   "commands": {
     "_execute_action": {
