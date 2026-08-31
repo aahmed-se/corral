@@ -1,0 +1,24 @@
+{
+  "manifest_version": 3,
+  "name": "Corral — Bookmark Roundup",
+  "short_name": "Corral",
+  "version": "0.1.0",
+  "description": "Round up your bookmarks: folder-first organizing, instant search, and drag-and-drop at any scale. Everything stays on this device.",
+  "permissions": ["bookmarks", "storage", "unlimitedStorage"],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "Open Corral"
+  },
+  "commands": {
+    "_execute_action": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+O",
+        "mac": "MacCtrl+Shift+O"
+      },
+      "description": "Open Corral"
+    }
+  }
+}

@@ -1,0 +1,34 @@
+{
+  "name": "corral",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.18.0"
+  },
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "test": "node scripts/test-engine.mjs && node scripts/test-parse.mjs && node scripts/test-ops.mjs",
+    "benchmark": "node --expose-gc scripts/benchmark.mjs 500000",
+    "lint": "oxlint"
+  },
+  "dependencies": {
+    "@tanstack/react-virtual": "^3.14.10",
+    "dexie": "^4.4.5",
+    "lucide-react": "1.31.0",
+    "react": "19.2.6",
+    "react-dom": "19.2.6"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.2.7",
+    "@types/node": "22.19.19",
+    "@types/react": "19.2.14",
+    "@types/react-dom": "19.2.3",
+    "@vitejs/plugin-react": "6.0.2",
+    "fake-indexeddb": "^6.2.5",
+    "oxlint": "1.76.0",
+    "typescript": "5.9.3",
+    "vite": "8.0.13"
+  }
+}
