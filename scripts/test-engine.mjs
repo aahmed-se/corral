@@ -2,6 +2,7 @@
 // Usage: node scripts/test-engine.mjs   (Node 22.18+ strips TS types)
 
 import { ShardBuilder, ShardStore, parseQuery } from '../src/lib/search-engine.ts';
+import { buildTree, findTreeNode } from '../src/lib/folder-tree.ts';
 import { ViewIndex, ViewIndexBuilder, serializeViewData, deserializeViewData } from '../src/lib/view-index.ts';
 
 const assert = (cond, label) => {
@@ -91,6 +92,18 @@ const missing = { ...persisted };
 delete missing.hostCounts;
 assert(deserializeViewData(missing) === null, 'missing counts rejected');
 assert(deserializeViewData(undefined) === null, 'absent row rejected');
+
+// --- file-explorer folder rows --------------------------------------------------
+const tree = buildTree([
+  { folder: 'Work', count: 2 },
+  { folder: 'Work / Deep / Archive', count: 3 },
+  { folder: 'Work / Peer', count: 1 },
+]);
+const workNode = findTreeNode(tree, 'Work');
+assert(workNode && workNode.total === 6, 'folder tree rolls up descendant links');
+assert(workNode.children.map((node) => node.path).join(',') === 'Work / Deep,Work / Peer', 'folder view exposes only immediate children');
+assert(workNode.children[0].total === 3 && workNode.children[0].own === 0, 'missing intermediate folder is synthesized');
+assert(findTreeNode(tree, 'Work / Deep / Archive')?.own === 3, 'nested folder remains addressable');
 
 // --- scoped search (accept predicate) ------------------------------------------
 const sb2 = new ShardBuilder();

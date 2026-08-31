@@ -58,6 +58,8 @@ function formatBytes(bytes: number) {
 export function App() {
   const corral = useCorral();
   const selectAllRows = corral.selectAllRows;
+  const clearSelection = corral.clearSelection;
+  const selectedCount = corral.selected.size;
   const [menu, setMenu] = useState<MenuState | null>(null);
   const [menuHostCount, setMenuHostCount] = useState<number | null>(null);
   const [folderMenu, setFolderMenu] = useState<FolderMenuState | null>(null);
@@ -70,16 +72,23 @@ export function App() {
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
+      const overlayOpen = Boolean(document.querySelector('[aria-modal="true"], [role="menu"]'));
+      if (event.key === 'Escape') {
+        if (overlayOpen || selectedCount === 0) return;
+        event.preventDefault();
+        clearSelection();
+        return;
+      }
       if (!(event.metaKey || event.ctrlKey) || event.key.toLowerCase() !== 'a') return;
       const target = event.target;
       if (target instanceof Element && target.closest('input, textarea, select, [contenteditable], [role="dialog"], [role="menu"]')) return;
-      if (document.querySelector('[aria-modal="true"], [role="menu"]')) return;
+      if (overlayOpen) return;
       event.preventDefault();
       void selectAllRows();
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [selectAllRows]);
+  }, [clearSelection, selectAllRows, selectedCount]);
 
   const { drag, beginFromRow, beginFromFolder } = useDrag({
     dragIdsFor: useCallback((rowId: number) => (corral.selected.has(rowId) ? Array.from(corral.selected) : [rowId]), [corral.selected]),
@@ -186,12 +195,14 @@ export function App() {
     : corral.selection.view === 'all'
       ? 'All bookmarks'
       : corral.selection.folder;
-  const searchScope = corral.isSearching && corral.selection.view === 'folder' ? ` · in ${corral.selection.folder}` : '';
+  const searchScope = corral.isSearching && corral.selection.view === 'folder' ? ` · in ${corral.selection.folder} and subfolders` : '';
   const subtitle = corral.isSearching
     ? corral.search.pending
       ? `Searching…${searchScope}`
       : `${corral.search.total.toLocaleString()} matches in ${corral.search.elapsedMs < 1 ? '<1' : corral.search.elapsedMs.toFixed(1)} ms${corral.search.truncated ? ' · top results' : ''}${searchScope}`
-    : `${countLabel(corral.viewTotal, 'link')}${corral.selection.view === 'folder' ? ' · includes subfolders' : ''}`;
+    : corral.selection.view === 'folder'
+      ? `${countLabel(corral.viewTotal, 'link')} · ${countLabel(corral.folderEntries.length, 'folder')}`
+      : countLabel(corral.viewTotal, 'link');
 
   return (
     <div className="shell" data-busy={corral.busy || undefined}>

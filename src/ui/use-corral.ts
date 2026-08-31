@@ -1,4 +1,4 @@
-import { useCallback, useDeferredValue, useEffect, useRef, useState } from 'react';
+import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react';
 // Vite provides the constructor for `?worker` imports at build time.
 import EngineWorker from '../lib/worker.ts?worker';
 import type { IndexPhase, WorkerOp, WorkerResponse } from '../lib/worker.ts';
@@ -14,6 +14,7 @@ import {
   type ViewOptions,
 } from '../lib/db.ts';
 import { chromeBookmarksAvailable, downloadBlob, flattenChromeTree } from '../lib/import-export.ts';
+import { buildTree, findTreeNode } from '../lib/folder-tree.ts';
 
 export const PAGE_SIZE = 240;
 const SEARCH_LIMIT = 5_000;
@@ -160,7 +161,7 @@ export function useCorral() {
   const isSearching = deferredQuery.length > 0;
 
   const viewOptions = useCallback(
-    (offset = 0, limit = 0): ViewOptions => ({ view: selection.view, folder: selection.folder, subtree: true, sort, offset, limit }),
+    (offset = 0, limit = 0): ViewOptions => ({ view: selection.view, folder: selection.folder, subtree: false, sort, offset, limit }),
     [selection.folder, selection.view, sort],
   );
 
@@ -315,7 +316,7 @@ export function useCorral() {
   // --- view totals + invalidation ------------------------------------------------
   useEffect(() => {
     let cancelled = false;
-    void runOp<{ total: number }>({ kind: 'view-total', options: { view: selection.view, folder: selection.folder, subtree: true, sort, offset: 0, limit: 0 } })
+    void runOp<{ total: number }>({ kind: 'view-total', options: viewOptions() })
       .catch(() => ({ total: 0 }))
       .then(({ total }) => {
         if (cancelled) return;
@@ -325,7 +326,7 @@ export function useCorral() {
     return () => {
       cancelled = true;
     };
-  }, [invalidateList, runOp, selection.folder, selection.view, sort, stats]);
+  }, [invalidateList, runOp, stats, viewOptions]);
 
   // --- search -------------------------------------------------------------------
   const updateQuery = useCallback((value: string) => {
@@ -470,14 +471,6 @@ export function useCorral() {
     });
   }, []);
 
-  /** Base-URL expansion is deliberately exact-folder only. The visible folder
-   * list includes descendants, but this action must not silently reach into
-   * those child folders. The all-bookmarks view still spans the whole library. */
-  const baseUrlOptions = useCallback(() => ({
-    ...viewOptions(),
-    subtree: false,
-  }), [viewOptions]);
-
   useEffect(() => {
     const memberIds = Array.from(selected);
     if (memberIds.length === 0) {
@@ -494,7 +487,7 @@ export function useCorral() {
     void runOp<{ hosts: string[]; ids: number[] }>({
       kind: 'expand-host-selection',
       ids: memberIds,
-      options: baseUrlOptions(),
+      options: viewOptions(),
     })
       .then(({ hosts, ids }) => {
         if (!cancelled) setBaseUrlSelection({ ids, hosts, pending: false });
@@ -505,7 +498,7 @@ export function useCorral() {
     return () => {
       cancelled = true;
     };
-  }, [baseUrlOptions, isSearching, runOp, selected, viewTotal]);
+  }, [isSearching, runOp, selected, viewOptions, viewTotal]);
 
   const selectAllWithBaseUrl = useCallback(() => {
     if (baseUrlSelection.pending || baseUrlSelection.ids.length === 0) return;
@@ -759,7 +752,11 @@ export function useCorral() {
     workerRef.current?.postMessage({ type: 'favicons-stop' });
   }, []);
 
-  const itemCount = isSearching ? search.ids.length : viewTotal;
+  const folderEntries = useMemo(() => {
+    if (isSearching || selection.view !== 'folder') return [];
+    return findTreeNode(buildTree(folders), selection.folder)?.children ?? [];
+  }, [folders, isSearching, selection.folder, selection.view]);
+  const itemCount = isSearching ? search.ids.length : viewTotal + folderEntries.length;
   const baseUrlSelectionComplete =
     baseUrlSelection.ids.length === selected.size && baseUrlSelection.ids.every((id) => selected.has(id));
 
@@ -767,7 +764,7 @@ export function useCorral() {
     stats, folders, index, storageUsage,
     selection, chooseView, sort, changeSort, density, setDensity,
     query, setQuery: updateQuery, deferredQuery, isSearching, search,
-    itemCount, viewTotal, listVersion, loadPage, recordAt,
+    itemCount, viewTotal, folderEntries, listVersion, loadPage, recordAt,
     selected, setSelected, clickRow, toggleSelected, selectAllRows,
     selectAllWithBaseUrl, baseUrlMatchCount: baseUrlSelection.ids.length,
     baseUrlHostCount: baseUrlSelection.hosts.length, baseUrlSelectionPending: baseUrlSelection.pending,

@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef, type CSSProperties, type PointerEvent as ReactPointerEvent } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
-import { CheckSquare, Square } from 'lucide-react';
+import { CheckSquare, ChevronRight, Folder, Square } from 'lucide-react';
 import { db, type BookmarkRecord } from '../lib/db.ts';
-import { PAGE_SIZE, type Corral, type Density } from './use-corral.ts';
+import { countLabel, PAGE_SIZE, type Corral, type Density } from './use-corral.ts';
 
 const ROW_HEIGHT: Record<Density, number> = { roomy: 62, cozy: 42, compact: 28 };
 
@@ -50,6 +50,8 @@ export function BookmarkList({ corral, onRowPointerDown, onRowContextMenu, onImp
   onImport: () => void;
 }) {
   const { itemCount, isSearching, recordAt, selected, density, listVersion, loadPage } = corral;
+  const folderEntries = isSearching ? [] : corral.folderEntries;
+  const folderRowCount = folderEntries.length;
   const listRef = useRef<HTMLDivElement>(null);
 
   const virtualizer = useVirtualizer({
@@ -67,8 +69,12 @@ export function BookmarkList({ corral, onRowPointerDown, onRowContextMenu, onImp
 
   const virtualRows = virtualizer.getVirtualItems();
   const pageSignature = useMemo(
-    () => Array.from(new Set(virtualRows.map((row) => Math.floor(row.index / PAGE_SIZE)))).join(','),
-    [virtualRows],
+    () => Array.from(new Set(
+      virtualRows
+        .filter((row) => row.index >= folderRowCount)
+        .map((row) => Math.floor((row.index - folderRowCount) / PAGE_SIZE)),
+    )).join(','),
+    [folderRowCount, virtualRows],
   );
   useEffect(() => {
     if (!pageSignature) return;
@@ -90,11 +96,12 @@ export function BookmarkList({ corral, onRowPointerDown, onRowContextMenu, onImp
   const visibleHosts = useMemo(() => {
     const hosts = new Set<string>();
     for (const row of virtualRows) {
-      const record = recordAt(row.index);
+      if (row.index < folderRowCount) continue;
+      const record = recordAt(row.index - folderRowCount);
       if (record) hosts.add(record.host);
     }
     return Array.from(hosts);
-  }, [recordAt, virtualRows]);
+  }, [folderRowCount, recordAt, virtualRows]);
 
   useEffect(() => {
     const missing = visibleHosts.filter((host) => !iconUrls.has(host) && !iconLookups.has(host));
@@ -124,7 +131,7 @@ export function BookmarkList({ corral, onRowPointerDown, onRowContextMenu, onImp
   if (itemCount === 0) {
     return (
       <div className="list-empty" ref={listRef}>
-        {corral.stats.total === 0 ? (
+        {corral.stats.total === 0 && corral.selection.view === 'all' ? (
           <>
             <h2>Nothing corralled yet</h2>
             <p>Copy your Chrome bookmarks or import an export file — everything stays on this device.</p>
@@ -146,13 +153,46 @@ export function BookmarkList({ corral, onRowPointerDown, onRowContextMenu, onImp
   }
 
   return (
-    <div className={`bookmark-list density-${density}`} ref={listRef} role="listbox" aria-multiselectable="true" aria-label="Bookmarks" data-drag-scroll="true">
+    <div className={`bookmark-list density-${density}`} ref={listRef} role="listbox" aria-multiselectable="true" aria-label="Folder contents" data-drag-scroll="true">
       <div className="virtual-space" style={{ height: virtualizer.getTotalSize() }}>
         {virtualRows.map((virtualRow) => {
-          const record = recordAt(virtualRow.index);
+          const folder = folderEntries[virtualRow.index];
+          if (folder) {
+            const openFolder = () => corral.chooseView({ view: 'folder', folder: folder.path });
+            return (
+              <div
+                key={`folder-${folder.path}`}
+                className="row folder-row"
+                style={{ transform: `translateY(${virtualRow.start}px)`, height: virtualRow.size }}
+                role="option"
+                aria-label={`${folder.name}, ${countLabel(folder.total, 'link')}`}
+                aria-selected="false"
+                tabIndex={0}
+                onClick={openFolder}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter' || event.key === ' ') {
+                    event.preventDefault();
+                    openFolder();
+                  }
+                }}
+              >
+                <span className="folder-spacer" aria-hidden="true" />
+                <span className="folder-mark" aria-hidden="true"><Folder /></span>
+                <span className="row-copy">
+                  <span className="row-title">{folder.name}</span>
+                  {density === 'roomy' && <span className="row-url">{folder.path}</span>}
+                </span>
+                <span className="folder-count">{countLabel(folder.total, 'link')}</span>
+                <ChevronRight className="folder-chevron" aria-hidden="true" />
+              </div>
+            );
+          }
+
+          const bookmarkIndex = virtualRow.index - folderRowCount;
+          const record = recordAt(bookmarkIndex);
           if (!record?.id) {
             return (
-              <div key={`ghost-${virtualRow.index}`} className="row placeholder" aria-hidden="true" style={{ transform: `translateY(${virtualRow.start}px)`, height: virtualRow.size }}>
+              <div key={`ghost-${bookmarkIndex}`} className="row placeholder" aria-hidden="true" style={{ transform: `translateY(${virtualRow.start}px)`, height: virtualRow.size }}>
                 <span className="ph ph-mark" /><span className="ph ph-line" />
               </div>
             );
@@ -168,9 +208,9 @@ export function BookmarkList({ corral, onRowPointerDown, onRowContextMenu, onImp
               aria-selected={isSelected}
               tabIndex={0}
               onPointerDown={(event) => onRowPointerDown(event, record)}
-              onClick={(event) => void corral.clickRow(virtualRow.index, record, event)}
+              onClick={(event) => void corral.clickRow(bookmarkIndex, record, event)}
               onDoubleClick={() => openRecord(record)}
-              onContextMenu={(event) => onRowContextMenu(event, record, virtualRow.index)}
+              onContextMenu={(event) => onRowContextMenu(event, record, bookmarkIndex)}
               onKeyDown={(event) => {
                 if (event.key === 'Enter') openRecord(record);
                 if (event.key === ' ') {

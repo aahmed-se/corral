@@ -411,6 +411,26 @@ body[data-dragging] * { cursor: grabbing !important; }
 .row-check:hover { color: var(--text); background: var(--raised-2); }
 .row-check svg { width: 15px; height: 15px; }
 
+.folder-row { cursor: pointer; }
+.folder-spacer { flex: 0 0 22px; height: 22px; }
+.folder-mark {
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 7px;
+  color: var(--accent-strong);
+  background: var(--accent-wash);
+  border: 1px solid rgb(129 140 248 / 20%);
+}
+.folder-mark svg { width: 15px; height: 15px; }
+.folder-count {
+  color: var(--text-muted);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+}
+.folder-chevron { width: 14px; height: 14px; color: var(--text-faint); }
+
 .site-mark {
   display: grid;
   place-items: center;
@@ -473,7 +493,11 @@ body[data-dragging] * { cursor: grabbing !important; }
 .density-compact .row-title { font-size: 12px; font-weight: 450; }
 .density-compact .row-check { width: 18px; height: 18px; }
 .density-compact .row-check svg { width: 13px; height: 13px; }
+.density-compact .folder-spacer { flex-basis: 18px; height: 18px; }
+.density-compact .folder-mark { width: 18px; height: 18px; border-radius: 5px; }
+.density-compact .folder-mark svg { width: 12px; height: 12px; }
 .density-roomy .site-mark { width: 30px; height: 30px; font-size: 12px; }
+.density-roomy .folder-mark { width: 30px; height: 30px; }
 
 .row.placeholder { pointer-events: none; }
 .ph {
