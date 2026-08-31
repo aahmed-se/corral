@@ -25,25 +25,33 @@ export function ContextMenu({ x, y, items, onClose }: {
   }, [x, y]);
 
   useEffect(() => {
+    // Containment check, not stopPropagation: this capture listener runs at
+    // the window before any bubble handler on the menu could stop it, so a
+    // pointerdown on a menu item would otherwise unmount the menu before its
+    // click event ever fires.
+    const closeIfOutside = (event: Event) => {
+      if (menuRef.current && event.composedPath().includes(menuRef.current)) return;
+      onClose();
+    };
     const close = () => onClose();
     const onKey = (event: KeyboardEvent) => {
       if (event.key === 'Escape') onClose();
     };
-    // Any click outside, scroll, or another context menu closes this one.
-    window.addEventListener('pointerdown', close, true);
+    // Any click outside, scroll, or window blur closes the menu.
+    window.addEventListener('pointerdown', closeIfOutside, true);
     window.addEventListener('blur', close);
     window.addEventListener('keydown', onKey);
-    window.addEventListener('wheel', close, { passive: true });
+    window.addEventListener('wheel', closeIfOutside, { passive: true });
     return () => {
-      window.removeEventListener('pointerdown', close, true);
+      window.removeEventListener('pointerdown', closeIfOutside, true);
       window.removeEventListener('blur', close);
       window.removeEventListener('keydown', onKey);
-      window.removeEventListener('wheel', close);
+      window.removeEventListener('wheel', closeIfOutside);
     };
   }, [onClose]);
 
   return (
-    <div ref={menuRef} className="context-menu" style={{ left: position.left, top: position.top }} role="menu" onPointerDown={(event) => event.stopPropagation()}>
+    <div ref={menuRef} className="context-menu" style={{ left: position.left, top: position.top }} role="menu">
       {items.map((item, index) =>
         item.kind === 'separator' ? (
           <div key={`sep-${index}`} className="menu-separator" role="separator" />
