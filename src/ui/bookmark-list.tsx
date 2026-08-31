@@ -195,7 +195,7 @@ export function BookmarkList({ corral, onRowPointerDown, onRowContextMenu, onImp
                 {density === 'roomy' && <span className="row-url">{record.url}</span>}
               </span>
               {density !== 'roomy' && <span className="row-host">{record.host}</span>}
-              {corral.selection.view === 'all' && density !== 'compact' && (
+              {(density !== 'compact' || (corral.selection.view === 'folder' && record.folder !== corral.selection.folder)) && (
                 <button
                   className="row-folder"
                   title={record.folder}

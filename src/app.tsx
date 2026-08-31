@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react';
 import {
   AlignJustify,
   Copy,
@@ -57,6 +57,7 @@ function formatBytes(bytes: number) {
 
 export function App() {
   const corral = useCorral();
+  const selectAllRows = corral.selectAllRows;
   const [menu, setMenu] = useState<MenuState | null>(null);
   const [menuHostCount, setMenuHostCount] = useState<number | null>(null);
   const [folderMenu, setFolderMenu] = useState<FolderMenuState | null>(null);
@@ -66,6 +67,19 @@ export function App() {
   const [importOpen, setImportOpen] = useState(false);
   const [exportOpen, setExportOpen] = useState(false);
   const searchRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (!(event.metaKey || event.ctrlKey) || event.key.toLowerCase() !== 'a') return;
+      const target = event.target;
+      if (target instanceof Element && target.closest('input, textarea, select, [contenteditable], [role="dialog"], [role="menu"]')) return;
+      if (document.querySelector('[aria-modal="true"], [role="menu"]')) return;
+      event.preventDefault();
+      void selectAllRows();
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [selectAllRows]);
 
   const { drag, beginFromRow, beginFromFolder } = useDrag({
     dragIdsFor: useCallback((rowId: number) => (corral.selected.has(rowId) ? Array.from(corral.selected) : [rowId]), [corral.selected]),
@@ -118,7 +132,9 @@ export function App() {
     if (!menu) return [];
     const { record, targetIds } = menu;
     const many = targetIds.length > 1;
-    const hostLabel = menuHostCount === null ? `Corral everything on ${record.host}…` : `Corral ${countLabel(menuHostCount)} on ${record.host}…`;
+    const hostLabel = menuHostCount === null
+      ? `Corral every bookmark on ${record.host} into a folder…`
+      : `Corral all ${countLabel(menuHostCount)} on ${record.host} into a folder…`;
     return [
       { kind: 'item', label: many ? `Open ${countLabel(targetIds.length)}` : 'Open', icon: <ExternalLink />, onSelect: () => {
         // Opening dozens of tabs at once is a popup-blocker fight; cap it.
@@ -175,7 +191,7 @@ export function App() {
     ? corral.search.pending
       ? `Searching…${searchScope}`
       : `${corral.search.total.toLocaleString()} matches in ${corral.search.elapsedMs < 1 ? '<1' : corral.search.elapsedMs.toFixed(1)} ms${corral.search.truncated ? ' · top results' : ''}${searchScope}`
-    : countLabel(corral.viewTotal, 'link');
+    : `${countLabel(corral.viewTotal, 'link')}${corral.selection.view === 'folder' ? ' · includes subfolders' : ''}`;
 
   return (
     <div className="shell" data-busy={corral.busy || undefined}>
@@ -271,9 +287,13 @@ export function App() {
           {corral.selected.size > 0 && (
             <div className="selection-bar">
               <strong>{corral.selected.size.toLocaleString()} selected</strong>
-              {corral.selected.size < corral.viewTotal && (
-                <button className="button ghost" onClick={() => void corral.selectAllWithBaseUrl()}>Select all with base URL</button>
-              )}
+              {corral.baseUrlSelectionPending ? (
+                <button className="button ghost" disabled>Counting base URL matches…</button>
+              ) : corral.canSelectAllWithBaseUrl ? (
+                <button className="button ghost" onClick={corral.selectAllWithBaseUrl}>
+                  Select all {corral.baseUrlMatchCount.toLocaleString()} with {corral.baseUrlHostCount === 1 ? 'this base URL' : 'these base URLs'}
+                </button>
+              ) : null}
               <button className="button ghost" onClick={corral.clearSelection}>Clear</button>
               <button className="button" onClick={() => setPicker({ kind: 'move', ids: Array.from(corral.selected), label: countLabel(corral.selected.size) })}>
                 <FolderInput /> Move

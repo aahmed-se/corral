@@ -54,6 +54,12 @@ export type FaviconState = {
   message?: string;
 };
 
+type BaseUrlSelection = {
+  ids: number[];
+  hosts: string[];
+  pending: boolean;
+};
+
 type UndoPlan =
   | { kind: 'folders'; moves: Array<{ id: number; folder: string }> }
   | { kind: 'records'; records: BookmarkRecord[] };
@@ -128,6 +134,7 @@ export function useCorral() {
   const [listVersion, setListVersion] = useState(0);
 
   const [selected, setSelected] = useState<Set<number>>(new Set());
+  const [baseUrlSelection, setBaseUrlSelection] = useState<BaseUrlSelection>({ ids: [], hosts: [], pending: false });
   const [busy, setBusy] = useState(false);
   const [busyLabel, setBusyLabel] = useState('');
   const [toast, setToast] = useState<ToastState | null>(null);
@@ -415,6 +422,16 @@ export function useCorral() {
     return ids;
   }, [isSearching, runOp, viewOptions]);
 
+  const selectAllRows = useCallback(async () => {
+    try {
+      const ids = await currentIds();
+      setSelected(new Set(ids));
+      selectionAnchorRef.current = null;
+    } catch (error) {
+      setToast({ message: error instanceof Error ? error.message : 'Could not select the current rows' });
+    }
+  }, [currentIds]);
+
   const clickRow = useCallback(async (rowIndex: number, record: BookmarkRecord, event: { shiftKey: boolean; metaKey: boolean; ctrlKey: boolean }) => {
     const id = record.id!;
     const toggle = event.metaKey || event.ctrlKey;
@@ -453,21 +470,48 @@ export function useCorral() {
     });
   }, []);
 
-  const selectAllWithBaseUrl = useCallback(async () => {
+  /** Base-URL expansion is deliberately exact-folder only. The visible folder
+   * list includes descendants, but this action must not silently reach into
+   * those child folders. The all-bookmarks view still spans the whole library. */
+  const baseUrlOptions = useCallback(() => ({
+    ...viewOptions(),
+    subtree: false,
+  }), [viewOptions]);
+
+  useEffect(() => {
     const memberIds = Array.from(selected);
-    if (memberIds.length === 0) return;
-    try {
-      const { ids } = await runOp<{ hosts: string[]; ids: number[] }>({
-        kind: 'expand-host-selection',
-        ids: memberIds,
-        options: viewOptions(),
-      });
-      setSelected(new Set(ids));
-      selectionAnchorRef.current = null;
-    } catch (error) {
-      setToast({ message: error instanceof Error ? error.message : 'Could not select matching base URLs' });
+    if (memberIds.length === 0) {
+      setBaseUrlSelection({ ids: [], hosts: [], pending: false });
+      return;
     }
-  }, [runOp, selected, viewOptions]);
+    if (!isSearching && memberIds.length === viewTotal) {
+      setBaseUrlSelection({ ids: [], hosts: [], pending: false });
+      return;
+    }
+
+    let cancelled = false;
+    setBaseUrlSelection({ ids: [], hosts: [], pending: true });
+    void runOp<{ hosts: string[]; ids: number[] }>({
+      kind: 'expand-host-selection',
+      ids: memberIds,
+      options: baseUrlOptions(),
+    })
+      .then(({ hosts, ids }) => {
+        if (!cancelled) setBaseUrlSelection({ ids, hosts, pending: false });
+      })
+      .catch(() => {
+        if (!cancelled) setBaseUrlSelection({ ids: [], hosts: [], pending: false });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [baseUrlOptions, isSearching, runOp, selected, viewTotal]);
+
+  const selectAllWithBaseUrl = useCallback(() => {
+    if (baseUrlSelection.pending || baseUrlSelection.ids.length === 0) return;
+    setSelected(new Set(baseUrlSelection.ids));
+    selectionAnchorRef.current = null;
+  }, [baseUrlSelection]);
 
   const clearSelection = useCallback(() => {
     setSelected(new Set());
@@ -716,13 +760,19 @@ export function useCorral() {
   }, []);
 
   const itemCount = isSearching ? search.ids.length : viewTotal;
+  const baseUrlSelectionComplete =
+    baseUrlSelection.ids.length === selected.size && baseUrlSelection.ids.every((id) => selected.has(id));
 
   return {
     stats, folders, index, storageUsage,
     selection, chooseView, sort, changeSort, density, setDensity,
     query, setQuery: updateQuery, deferredQuery, isSearching, search,
     itemCount, viewTotal, listVersion, loadPage, recordAt,
-    selected, setSelected, clickRow, toggleSelected, selectAllWithBaseUrl, clearSelection,
+    selected, setSelected, clickRow, toggleSelected, selectAllRows,
+    selectAllWithBaseUrl, baseUrlMatchCount: baseUrlSelection.ids.length,
+    baseUrlHostCount: baseUrlSelection.hosts.length, baseUrlSelectionPending: baseUrlSelection.pending,
+    canSelectAllWithBaseUrl: baseUrlSelection.ids.length > 0 && !baseUrlSelectionComplete,
+    clearSelection,
     moveIds, corralHost, deleteIds, importFromChrome, importFromFile, exportLibrary, hostCount,
     createFolder, renameFolder, moveFolder, deleteFolder, findDuplicates,
     favicons, faviconCount, iconVersion, buildFavicons, stopFavicons,
