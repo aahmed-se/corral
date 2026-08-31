@@ -5,6 +5,17 @@ export type FaviconSource = { mode: 'chrome' | 's2'; prefix: string; retryFailur
 export const FAVICON_OK_FRESH_MS = 30 * 24 * 3_600_000;
 export const FAVICON_MISSING_RETRY_MS = 24 * 3_600_000;
 export const FAVICON_ERROR_RETRY_MS = 15 * 60_000;
+export const FAVICON_MAX_BYTES = 1_048_576;
+
+/** Chrome's extension-local `_favicon` response does not consistently expose
+ * a normal image MIME type to workers. Treat the body as opaque image bytes;
+ * the browser's <img> decoder remains the final validity check in the UI. */
+export async function readFaviconBytes(response: Response) {
+  if (!response.ok) return null;
+  const bytes = await response.blob();
+  if (bytes.size === 0 || bytes.size > FAVICON_MAX_BYTES) return null;
+  return bytes;
+}
 
 /** Successful icons stay warm for a month. Failures cool down briefly during
  * resumed work, but an explicit user refresh retries them immediately. */

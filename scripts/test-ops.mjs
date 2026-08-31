@@ -8,6 +8,7 @@ import 'fake-indexeddb/auto';
 const { db, makeRecord, moveToFolder, deleteByIds, getRecordsByIds, addRecordsInBatches, getFallbackPage, markLibraryDirty, getDirtyRevision, getExtraFolders, setExtraFolders } =
   await import('../src/lib/db.ts');
 const { ViewIndex, ViewIndexBuilder } = await import('../src/lib/view-index.ts');
+const { FAVICON_MAX_BYTES, readFaviconBytes } = await import('../src/lib/favicon-cache.ts');
 
 const assert = (cond, label) => {
   if (!cond) {
@@ -99,6 +100,13 @@ await db.favicons.bulkPut([
   { host: 'missing.example', bytes: null, status: 'missing', fetchedAt: Date.now() },
 ]);
 assert((await db.favicons.where('status').equals('ok').count()) === 1, 'favicon success count excludes missing rows');
+
+// Chrome's extension-local favicon response may omit Content-Type. Usable
+// opaque bytes must still be cached, while empty/failed/oversized bodies are not.
+assert((await readFaviconBytes(new Response(new Blob(['icon']))))?.size === 4, 'favicon bytes work without image MIME metadata');
+assert((await readFaviconBytes(new Response(null, { status: 204 }))) === null, 'empty favicon response rejected');
+assert((await readFaviconBytes(new Response('no', { status: 404 }))) === null, 'failed favicon response rejected');
+assert((await readFaviconBytes(new Response(new Blob([new Uint8Array(FAVICON_MAX_BYTES + 1)])))) === null, 'oversized favicon response rejected');
 
 // Duplicate detection keys on the normalized URL stored at import time.
 const dupA = makeRecord({ title: 'Dup', url: 'https://Example.com/page/?utm_source=x#frag', folder: 'X', dateAdded: 1, source: 'json' });

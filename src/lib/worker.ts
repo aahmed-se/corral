@@ -33,6 +33,7 @@ import {
   chromeFaviconUrl,
   faviconNeedsFetch,
   previewFaviconUrl,
+  readFaviconBytes,
   type FaviconSource,
 } from './favicon-cache.ts';
 import { ShardBuilder, ShardStore, type ShardData } from './search-engine.ts';
@@ -678,25 +679,8 @@ function jsonParts(recordParts: string[]) {
 
 const FAVICON_CONCURRENCY = 8;
 const FAVICON_TIMEOUT_MS = 8_000;
-const FAVICON_MAX_BYTES = 1_048_576;
 
 let faviconRun = 0;
-
-async function decodeFavicon(response: Response) {
-  const contentType = (response.headers.get('content-type') ?? '').toLowerCase();
-  if (!response.ok || !contentType.startsWith('image/')) return null;
-  const bytes = await response.blob();
-  if (bytes.size === 0 || bytes.size > FAVICON_MAX_BYTES) return null;
-  if (typeof createImageBitmap === 'function') {
-    try {
-      const bitmap = await createImageBitmap(bytes);
-      bitmap.close();
-    } catch {
-      return null;
-    }
-  }
-  return bytes;
-}
 
 async function fetchFavicon(source: FaviconSource, host: string, samples: string[]): Promise<FaviconRow> {
   const requestUrls = source.mode === 'chrome'
@@ -708,7 +692,7 @@ async function fetchFavicon(source: FaviconSource, host: string, samples: string
       // Accepted bytes live in IndexedDB. Failed responses must not poison
       // alternate candidates or the user's next retry.
       const response = await fetch(requestUrl, { signal: AbortSignal.timeout(FAVICON_TIMEOUT_MS), cache: 'no-store' });
-      const bytes = await decodeFavicon(response);
+      const bytes = await readFaviconBytes(response);
       if (bytes) return { host, bytes, status: 'ok', fetchedAt: Date.now() };
       if (response.status >= 500) hadError = true;
     } catch {
