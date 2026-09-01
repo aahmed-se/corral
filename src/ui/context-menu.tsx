@@ -11,6 +11,7 @@ export function ContextMenu({ x, y, items, onClose }: {
   onClose: () => void;
 }) {
   const menuRef = useRef<HTMLDivElement>(null);
+  const priorFocusRef = useRef<HTMLElement | null>(document.activeElement instanceof HTMLElement ? document.activeElement : null);
   const [position, setPosition] = useState({ left: x, top: y });
 
   // Clamp inside the viewport once rendered.
@@ -25,6 +26,7 @@ export function ContextMenu({ x, y, items, onClose }: {
   }, [x, y]);
 
   useEffect(() => {
+    menuRef.current?.querySelector<HTMLButtonElement>('[role="menuitem"]')?.focus();
     // Containment check, not stopPropagation: this capture listener runs at
     // the window before any bubble handler on the menu could stop it, so a
     // pointerdown on a menu item would otherwise unmount the menu before its
@@ -47,11 +49,38 @@ export function ContextMenu({ x, y, items, onClose }: {
       window.removeEventListener('blur', close);
       window.removeEventListener('keydown', onKey);
       window.removeEventListener('wheel', closeIfOutside);
+      priorFocusRef.current?.focus();
     };
   }, [onClose]);
 
+  const moveFocus = (direction: 1 | -1) => {
+    const buttons = Array.from(menuRef.current?.querySelectorAll<HTMLButtonElement>('[role="menuitem"]') ?? []);
+    if (buttons.length === 0) return;
+    const current = buttons.indexOf(document.activeElement as HTMLButtonElement);
+    buttons[(current + direction + buttons.length) % buttons.length]?.focus();
+  };
+
   return (
-    <div ref={menuRef} className="context-menu" style={{ left: position.left, top: position.top }} role="menu">
+    <div
+      ref={menuRef}
+      className="context-menu"
+      style={{ left: position.left, top: position.top }}
+      role="menu"
+      onKeyDown={(event) => {
+        if (event.key === 'ArrowDown') { event.preventDefault(); moveFocus(1); }
+        if (event.key === 'ArrowUp') { event.preventDefault(); moveFocus(-1); }
+        if (event.key === 'Home') {
+          event.preventDefault();
+          menuRef.current?.querySelector<HTMLButtonElement>('[role="menuitem"]')?.focus();
+        }
+        if (event.key === 'End') {
+          event.preventDefault();
+          const buttons = menuRef.current?.querySelectorAll<HTMLButtonElement>('[role="menuitem"]');
+          const last = buttons?.item((buttons?.length ?? 0) - 1);
+          last?.focus();
+        }
+      }}
+    >
       {items.map((item, index) =>
         item.kind === 'separator' ? (
           <div key={`sep-${index}`} className="menu-separator" role="separator" />

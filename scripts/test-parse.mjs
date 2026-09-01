@@ -4,6 +4,7 @@
 import { parseNetscapeHtml, parseBookmarkJson, toNetscapeHtmlParts, flattenChromeTree } from '../src/lib/import-export.ts';
 import { makeRecord } from '../src/lib/db.ts';
 import { countImportKeys, importKey, selectUnmatchedInputs } from '../src/lib/import-merge.ts';
+import { openableBookmarkUrl } from '../src/lib/bookmark-url.ts';
 
 const assert = (cond, label) => {
   if (!cond) {
@@ -59,6 +60,10 @@ for (const record of records) {
 // JSON import shape.
 const json = parseBookmarkJson(JSON.stringify({ records: [{ title: 'J', url: 'https://j.example/x', folder: 'F', dateAdded: 5 }] }));
 assert(json.length === 1 && json[0].folder === 'F', 'json import');
+assert(openableBookmarkUrl('https://safe.example/path') !== null, 'https bookmark can open');
+assert(openableBookmarkUrl('chrome://settings/') !== null, 'Chrome bookmark can open');
+assert(openableBookmarkUrl('JaVaScRiPt:alert(document.domain)') === null, 'javascript bookmark is blocked');
+assert(openableBookmarkUrl('data:text/html,<script>alert(1)</script>') === null, 'data bookmark is blocked');
 
 // Repeat imports merge without changing current records. Matching is based on
 // normalized URL, so local folder state and tracking-parameter differences do

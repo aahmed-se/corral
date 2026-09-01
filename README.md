@@ -22,7 +22,7 @@ The UI thread only renders; a worker owns all data work:
 - `src/lib/search-engine.ts` — sharded flat-haystack substring scanner. No inverted index to build or restore; the "index" is the concatenated text, scanned with `String.indexOf`.
 - `src/lib/view-index.ts` — in-memory row ordering and aggregates: one sort permutation per sort mode plus compact filter/count arrays. A page at any scroll depth is an id slice + primary-key `bulkGet`; folder counts and per-host membership come from the same arrays. Nothing on disk scales with unique-host count.
 - `src/lib/worker.ts` — one streamed pass builds search shards + view ordering with per-phase progress; mutations run as serialized ops with streamed progress and conservative recovery; imports, exports, and parsing (a DOMParser-free tokenizer) all execute here.
-- `src/lib/db.ts` — Dexie store with deliberately few indexes (`source`, `folder`); IndexedDB serves primary-key lookups, never offset cursors.
+- `src/lib/db.ts` — Dexie store with one bookmark secondary index (`folder`); IndexedDB serves primary-key lookups, never deep offset cursors.
 
 ## Develop
 
@@ -39,4 +39,4 @@ npm run build      # dist/ = loadable unpacked Chrome extension
 1. `npm run build`
 2. Open `chrome://extensions`, enable **Developer mode**.
 3. **Load unpacked** → select the `dist/` folder.
-4. Click the Corral toolbar button (or Ctrl/⌘-Shift-O).
+4. Click the Corral toolbar button (or Ctrl/⌘-Shift-O). Repeated clicks focus the existing Corral tab.

@@ -4,6 +4,7 @@
 // Usage: node scripts/test-ops.mjs
 
 import 'fake-indexeddb/auto';
+import Dexie from 'dexie';
 
 const { db, makeRecord, moveToFolder, deleteByIds, getRecordsByIds, addRecordsInBatches, getFallbackPage, markLibraryDirty, getDirtyRevision, getExtraFolders, setExtraFolders } =
   await import('../src/lib/db.ts');
@@ -30,6 +31,26 @@ for (let i = 1; i <= 900; i += 1) {
 }
 await addRecordsInBatches(seed);
 assert((await db.bookmarks.count()) === 900, 'seeded');
+assert(!db.bookmarks.schema.indexes.some((index) => index.name === 'source'), 'dead source index removed without losing rows');
+
+// A real v1 database upgrades through every production schema version. The
+// v4 index removal must retain records and the remaining folder index.
+const upgradeName = 'corral-v1-to-v4-test';
+const legacyDb = new Dexie(upgradeName);
+legacyDb.version(1).stores({ bookmarks: '++id, source, folder', meta: '&key', searchShards: '&seq, revision', viewData: '&revision' });
+await legacyDb.open();
+await legacyDb.table('bookmarks').add(seed[0]);
+legacyDb.close();
+const upgradedDb = new Dexie(upgradeName);
+upgradedDb.version(1).stores({ bookmarks: '++id, source, folder', meta: '&key', searchShards: '&seq, revision', viewData: '&revision' });
+upgradedDb.version(2).stores({ favicons: '&host, fetchedAt' });
+upgradedDb.version(3).stores({ favicons: '&host, status, fetchedAt' });
+upgradedDb.version(4).stores({ bookmarks: '++id, folder' });
+await upgradedDb.open();
+assert((await upgradedDb.table('bookmarks').count()) === 1, 'v1 to v4 upgrade retains bookmark rows');
+assert(!upgradedDb.table('bookmarks').schema.indexes.some((index) => index.name === 'source'), 'v1 to v4 upgrade drops only source index');
+assert(upgradedDb.table('bookmarks').schema.indexes.some((index) => index.name === 'folder'), 'v1 to v4 upgrade retains folder index');
+await upgradedDb.delete();
 
 // Build a view index the way the worker's scan does.
 const folderIds = new Map();
@@ -79,6 +100,8 @@ const victims = restored.slice(0, 50).map((record) => record.id);
 await markLibraryDirty();
 const dirtyBefore = await getDirtyRevision();
 assert(dirtyBefore > 0, 'dirty token set');
+await markLibraryDirty();
+assert((await getDirtyRevision()) > dirtyBefore, 'dirty token increases monotonically');
 await deleteByIds(victims);
 assert((await db.bookmarks.count()) === 850, 'delete applied');
 

@@ -78,6 +78,7 @@ type PendingOp = {
 
 const emptyStats: LibraryStats = {
   key: 'stats',
+  indexVersion: 0,
   revision: 0,
   dirtyRevision: 0,
   total: 0,
@@ -243,6 +244,7 @@ export function useCorral() {
       }
       if (message.type === 'results') {
         if (message.requestId !== searchRequestRef.current) return;
+        selectionAnchorRef.current = null;
         pageGenerationRef.current += 1;
         for (const key of loadingPagesRef.current.keys()) if (key.startsWith('s')) loadingPagesRef.current.delete(key);
         searchIdsRef.current = message.ids;
@@ -410,8 +412,15 @@ export function useCorral() {
 
   const changeSort = useCallback((mode: SortMode) => {
     dropInFlightPages();
+    selectionAnchorRef.current = null;
     setSort(mode);
   }, [dropInFlightPages]);
+
+  // A range anchor is an index into one specific ordered result list. It must
+  // never survive a query/scope identity change and point into another list.
+  useEffect(() => {
+    selectionAnchorRef.current = null;
+  }, [deferredQuery, selection.folder, selection.view, sort]);
 
   // --- selection -------------------------------------------------------------------
   /** Ordered ids of the current list (view or search), cached per invalidation. */
@@ -490,6 +499,7 @@ export function useCorral() {
       kind: 'expand-host-selection',
       ids: memberIds,
       options: viewOptions(),
+      scopeIds: isSearching ? searchIdsRef.current : undefined,
     })
       .then(({ hosts, ids }) => {
         if (!cancelled) setBaseUrlSelection({ ids, hosts, pending: false });
@@ -500,11 +510,15 @@ export function useCorral() {
     return () => {
       cancelled = true;
     };
-  }, [isSearching, runOp, selected, viewOptions, viewTotal]);
+  }, [isSearching, runOp, search.ids, selected, viewOptions, viewTotal]);
 
   const selectAllWithBaseUrl = useCallback(() => {
     if (baseUrlSelection.pending || baseUrlSelection.ids.length === 0) return;
-    setSelected(new Set(baseUrlSelection.ids));
+    setSelected((current) => {
+      const next = new Set(current);
+      for (const id of baseUrlSelection.ids) next.add(id);
+      return next;
+    });
     selectionAnchorRef.current = null;
   }, [baseUrlSelection]);
 
@@ -763,8 +777,8 @@ export function useCorral() {
     return findTreeNode(buildTree(folders), selection.folder)?.children ?? [];
   }, [folders, isSearching, selection.folder, selection.view]);
   const itemCount = isSearching ? search.ids.length : viewTotal + folderEntries.length;
-  const baseUrlSelectionComplete =
-    baseUrlSelection.ids.length === selected.size && baseUrlSelection.ids.every((id) => selected.has(id));
+  const baseUrlSelectionComplete = baseUrlSelection.ids.every((id) => selected.has(id));
+  const baseUrlMatchCount = new Set([...selected, ...baseUrlSelection.ids]).size;
 
   return {
     stats, folders, index, storageUsage,
@@ -772,7 +786,7 @@ export function useCorral() {
     query, setQuery: updateQuery, deferredQuery, isSearching, search,
     itemCount, viewTotal, folderEntries, listVersion, loadPage, recordAt,
     selected, setSelected, clickRow, toggleSelected, selectAllRows,
-    selectAllWithBaseUrl, baseUrlMatchCount: baseUrlSelection.ids.length,
+    selectAllWithBaseUrl, baseUrlMatchCount,
     baseUrlHostCount: baseUrlSelection.hosts.length, baseUrlSelectionPending: baseUrlSelection.pending,
     canSelectAllWithBaseUrl: baseUrlSelection.ids.length > 0 && !baseUrlSelectionComplete,
     clearSelection,

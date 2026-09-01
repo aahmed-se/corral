@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef, type CSSProperties, type PointerEvent as ReactPointerEvent } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { CheckSquare, ChevronRight, Folder, Square } from 'lucide-react';
+import { openableBookmarkUrl } from '../lib/bookmark-url.ts';
 import { db, type BookmarkRecord } from '../lib/db.ts';
 import { countLabel, PAGE_SIZE, type Corral, type Density } from './use-corral.ts';
 
@@ -21,6 +22,29 @@ function formatDate(timestamp: number) {
 // so the letter mark renders without retrying every page.
 const iconUrls = new Map<string, string | null>();
 const iconLookups = new Set<string>();
+const ICON_URL_LIMIT = 1_024;
+
+function releaseIconUrl(url: string | null | undefined) {
+  if (url) URL.revokeObjectURL(url);
+}
+
+function cacheIconUrl(host: string, url: string | null) {
+  releaseIconUrl(iconUrls.get(host));
+  iconUrls.delete(host);
+  iconUrls.set(host, url);
+  while (iconUrls.size > ICON_URL_LIMIT) {
+    const oldest = iconUrls.keys().next().value as string | undefined;
+    if (oldest === undefined) break;
+    releaseIconUrl(iconUrls.get(oldest));
+    iconUrls.delete(oldest);
+  }
+}
+
+function clearIconUrls() {
+  for (const url of iconUrls.values()) releaseIconUrl(url);
+  iconUrls.clear();
+  iconLookups.clear();
+}
 
 function SiteMark({ host }: { host: string }) {
   let hue = 0;
@@ -34,7 +58,7 @@ function SiteMark({ host }: { host: string }) {
           src={iconUrl}
           alt=""
           onError={(event) => {
-            iconUrls.set(host, null);
+            cacheIconUrl(host, null);
             event.currentTarget.style.display = 'none';
             // Do not leave undecodable bytes marked fresh for a month.
             void db.favicons.delete(host);
@@ -86,12 +110,12 @@ export function BookmarkList({ corral, onRowPointerDown, onRowContextMenu, onImp
   // --- favicons: resolve icons for the hosts currently on screen ---------------
   const [, bumpIcons] = useReducer((tick: number) => tick + 1, 0);
 
+  useEffect(() => clearIconUrls, []);
+
   // A finished favicon build invalidates everything already resolved.
   useEffect(() => {
     if (corral.iconVersion === 0) return;
-    for (const url of iconUrls.values()) if (url) URL.revokeObjectURL(url);
-    iconUrls.clear();
-    iconLookups.clear();
+    clearIconUrls();
     bumpIcons();
   }, [corral.iconVersion]);
 
@@ -108,27 +132,38 @@ export function BookmarkList({ corral, onRowPointerDown, onRowContextMenu, onImp
   useEffect(() => {
     const missing = visibleHosts.filter((host) => !iconUrls.has(host) && !iconLookups.has(host));
     if (missing.length === 0) return;
+    let cancelled = false;
     for (const host of missing) iconLookups.add(host);
     void db.favicons
       .bulkGet(missing)
       .then((rows) => {
+        if (cancelled) return;
         rows.forEach((row, index) => {
           const host = missing[index]!;
           iconLookups.delete(host);
-          iconUrls.set(host, row?.bytes ? URL.createObjectURL(row.bytes) : null);
+          cacheIconUrl(host, row?.bytes ? URL.createObjectURL(row.bytes) : null);
         });
         bumpIcons();
       })
       .catch(() => {
         for (const host of missing) iconLookups.delete(host);
       });
+    return () => {
+      cancelled = true;
+      for (const host of missing) iconLookups.delete(host);
+    };
     // iconVersion: a finished build clears the cache (effect above), and the
     // hosts on screen — unchanged by that — must be looked up again.
   }, [visibleHosts, corral.iconVersion]);
 
   const openRecord = useCallback((record: BookmarkRecord) => {
-    window.open(record.url, '_blank', 'noopener,noreferrer');
-  }, []);
+    const url = openableBookmarkUrl(record.url);
+    if (!url) {
+      corral.setToast({ message: 'That bookmark uses a blocked or invalid URL.' });
+      return;
+    }
+    window.open(url, '_blank', 'noopener,noreferrer');
+  }, [corral]);
 
   if (itemCount === 0) {
     return (

@@ -66,7 +66,9 @@ function cleanField(value: string) {
 }
 
 export function recordText(record: SearchableRecord) {
-  return `${cleanField(record.title)}${FIELD_SEP}${cleanField(record.url)}${FIELD_SEP}${cleanField(record.host)}${FIELD_SEP}${cleanField(record.folder)}`.toLowerCase();
+  // Host precedes URL so a hostname hit is scored as a site match instead of
+  // being stolen by the same text inside the full URL.
+  return `${cleanField(record.title)}${FIELD_SEP}${cleanField(record.host)}${FIELD_SEP}${cleanField(record.url)}${FIELD_SEP}${cleanField(record.folder)}`.toLowerCase();
 }
 
 export function parseQuery(query: string) {
@@ -226,12 +228,12 @@ function flushShard(buckets: number[][], scores: number[], ids: number[]) {
  * occurrence within the slice. */
 function scoreRecord(record: string, scanHit: number, scanTermLength: number, rest: string[]) {
   const titleEnd = record.indexOf(FIELD_SEP);
-  const urlEnd = record.indexOf(FIELD_SEP, titleEnd + 1);
-  const hostEnd = record.indexOf(FIELD_SEP, urlEnd + 1);
+  const hostEnd = record.indexOf(FIELD_SEP, titleEnd + 1);
+  const urlEnd = record.indexOf(FIELD_SEP, hostEnd + 1);
   const fieldScore = (hit: number) => {
     if (hit < titleEnd) return hit === 0 ? SCORE_TITLE_PREFIX : SCORE_TITLE;
-    if (hit < urlEnd) return SCORE_URL;
     if (hit < hostEnd) return SCORE_HOST;
+    if (hit < urlEnd) return SCORE_URL;
     return SCORE_FOLDER;
   };
   let score = fieldScore(scanHit) + (scanTermLength >= 3 ? 1 : 0);

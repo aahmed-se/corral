@@ -34,6 +34,8 @@ export type FolderCount = { folder: string; count: number };
 
 export type LibraryStats = {
   key: 'stats';
+  /** Invalidates persisted shards when their searchable-field layout changes. */
+  indexVersion: number;
   revision: number;
   /** The library's dirty token at the time this index was built. */
   dirtyRevision: number;
@@ -96,9 +98,8 @@ class CorralDatabase extends Dexie {
 
   constructor() {
     super('corral');
-    // Ordering, search, and aggregates live in the worker's in-memory index —
-    // secondary indexes here would only tax inserts. 'source' serves Chrome
-    // re-copies, 'folder' serves export streaming and pre-index paging.
+    // Ordering, search, and aggregates live in the worker's in-memory index.
+    // `folder` alone serves export streaming and pre-index paging.
     this.version(1).stores({
       bookmarks: '++id, source, folder',
       meta: '&key',
@@ -112,6 +113,12 @@ class CorralDatabase extends Dexie {
     // v3: status makes successful-cache counts cheap and accurate.
     this.version(3).stores({
       favicons: '&host, status, fetchedAt',
+    });
+    // v4: source is record metadata, not a query path. Dropping its index
+    // removes write amplification from every large import without touching
+    // any bookmark rows.
+    this.version(4).stores({
+      bookmarks: '++id, folder',
     });
   }
 }
@@ -183,7 +190,11 @@ export function makeRecord(
  * interrupted by closing the tab) can never pass the restore-validity check —
  * even when the record count happens to match. */
 export async function markLibraryDirty() {
-  await db.meta.put({ key: 'dirty', revision: Date.now() });
+  await db.transaction('rw', db.meta, async () => {
+    const row = await db.meta.get('dirty');
+    const previous = row && row.key === 'dirty' ? row.revision : 0;
+    await db.meta.put({ key: 'dirty', revision: Math.max(Date.now(), previous + 1) });
+  });
 }
 
 export async function getDirtyRevision() {
@@ -196,6 +207,7 @@ export async function getLibraryStats(): Promise<LibraryStats> {
   if (stored && stored.key === 'stats') return stored;
   return {
     key: 'stats',
+    indexVersion: 0,
     revision: 0,
     dirtyRevision: 0,
     total: await db.bookmarks.count(),

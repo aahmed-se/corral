@@ -70,7 +70,7 @@ export type WorkerOp =
   | { kind: 'host-count'; host: string }
   /** Expands a selection to every bookmark with the same base hosts inside
    * the active all/folder scope. */
-  | { kind: 'expand-host-selection'; ids: number[]; options: ViewOptions }
+  | { kind: 'expand-host-selection'; ids: number[]; options: ViewOptions; scopeIds?: number[] }
   | { kind: 'view-ids'; options: ViewOptions }
   | { kind: 'view-total'; options: ViewOptions };
 
@@ -106,6 +106,9 @@ const scope = self as unknown as {
 const SCAN_CHUNK = 4_000;
 const SHARD_WRITE_CHUNK = 8;
 const INSERT_CHUNK = 5_000;
+const INDEX_FORMAT_VERSION = 2;
+const REBUILD_LOCK = 'corral-index-rebuild';
+const MUTATION_LOCK = 'corral-library-mutation';
 /** Deletions larger than this skip the in-memory undo payload. */
 export const UNDO_RECORD_LIMIT = 50_000;
 
@@ -114,6 +117,7 @@ let servingViews: ViewIndex | null = null;
 let servingRevision = 0;
 let rebuilding = false;
 let rebuildAgain = false;
+let forceRebuildAgain = false;
 let pendingTombstones: number[] = [];
 
 function post(message: WorkerResponse) {
@@ -128,8 +132,19 @@ async function persistTombstones() {
 }
 
 async function boot() {
+  await rebuild();
+}
+
+async function withBrowserLock<T>(name: string, mode: LockMode, task: () => Promise<T>) {
+  if (!navigator.locks) return task();
+  return navigator.locks.request(name, { mode }, task);
+}
+
+/** Loads a complete, current persisted index. This runs under the rebuild
+ * lock, so another tab cannot clear the shard stores halfway through. */
+async function restorePersistedIndex() {
   const stats = await db.meta.get('stats');
-  if (stats && stats.key === 'stats' && stats.indexedAt > 0) {
+  if (stats && stats.key === 'stats' && stats.indexVersion === INDEX_FORMAT_VERSION && stats.indexedAt > 0) {
     const tombstoneRow = await db.meta.get('tombstones');
     const tombstones = tombstoneRow && tombstoneRow.key === 'tombstones' && tombstoneRow.revision === stats.revision
       ? Array.from(tombstoneRow.ids)
@@ -144,29 +159,58 @@ async function boot() {
         serving = ShardStore.fromShards(shards, tombstones);
         servingViews = new ViewIndex(viewData, tombstones);
         servingRevision = stats.revision;
-        post({ type: 'ready', stats, restored: true });
-        // Tombstones mean the on-disk index predates some deletions;
-        // reconcile in the background while the restored index serves.
-        if (tombstones.length > 0) void rebuild();
-        return;
+        return { stats, tombstones: tombstones.length };
       }
     }
   }
-  await rebuild();
+  return null;
 }
 
-async function rebuild() {
+async function rebuild(force = false) {
   if (rebuilding) {
     rebuildAgain = true;
+    forceRebuildAgain ||= force;
     return;
   }
   rebuilding = true;
   rebuildAgain = false;
-  pendingTombstones = [];
-  const started = performance.now();
-  const revision = Date.now();
+  forceRebuildAgain = false;
 
   try {
+    await withBrowserLock(REBUILD_LOCK, 'exclusive', async () => {
+      if (!force) {
+        const restored = await restorePersistedIndex();
+        if (restored) {
+          post({ type: 'ready', stats: restored.stats, restored: true });
+          // A tombstoned index is safe to serve but should be compacted once.
+          if (restored.tombstones > 0) {
+            rebuildAgain = true;
+            forceRebuildAgain = true;
+          }
+          return;
+        }
+      }
+      await buildFreshIndex();
+    });
+  } catch (error) {
+    post({ type: 'fatal', message: error instanceof Error ? error.message : 'Indexing failed' });
+  } finally {
+    rebuilding = false;
+    const rerun = rebuildAgain;
+    const rerunForce = forceRebuildAgain;
+    rebuildAgain = false;
+    forceRebuildAgain = false;
+    if (rerun) void rebuild(rerunForce);
+  }
+}
+
+async function buildFreshIndex() {
+  pendingTombstones = [];
+  const started = performance.now();
+  const previousStats = await db.meta.get('stats');
+  const previousRevision = previousStats && previousStats.key === 'stats' ? previousStats.revision : 0;
+  const revision = Math.max(Date.now(), previousRevision + 1);
+
     // Captured before the scan: a mutation landing mid-rebuild bumps the live
     // token past this, so an interrupted rebuild self-identifies as stale on
     // the next launch (rebuildAgain covers the current session).
@@ -243,6 +287,7 @@ async function rebuild() {
 
     const stats: LibraryStats = {
       key: 'stats',
+      indexVersion: INDEX_FORMAT_VERSION,
       revision,
       dirtyRevision,
       total: scanned,
@@ -258,22 +303,9 @@ async function rebuild() {
     pendingTombstones = [];
     await persistTombstones();
     await db.meta.put(stats);
-    // User-created folders that gained records now live in the scan; keeping
-    // them in the extras list would double them in the sidebar. Transactional,
-    // so a create-folder op landing mid-prune is not lost.
-    await db.transaction('rw', db.meta, async () => {
-      const row = await db.meta.get('extraFolders');
-      const names = row && row.key === 'extraFolders' ? row.names : [];
-      const pruned = names.filter((name) => !folderIds.has(name));
-      if (pruned.length !== names.length) await db.meta.put({ key: 'extraFolders', names: pruned });
-    });
+    // Extra-folder markers are retained even while occupied. If the last
+    // bookmark later leaves, a user-created folder must remain in the tree.
     post({ type: 'ready', stats, restored: false });
-  } catch (error) {
-    post({ type: 'fatal', message: error instanceof Error ? error.message : 'Indexing failed' });
-  } finally {
-    rebuilding = false;
-    if (rebuildAgain) void rebuild();
-  }
 }
 
 function applyTombstones(ids: number[]) {
@@ -323,7 +355,6 @@ type Progress = (label: string) => void;
 type OpOutcome = {
   payload?: unknown;
   rebuild?: boolean;
-  staleViews?: boolean;
   tombstoneIds?: number[];
 };
 
@@ -445,7 +476,7 @@ async function runOp(op: WorkerOp, progress: Progress): Promise<OpOutcome> {
       if (additions.length === 0) return { payload: { imported: 0, skipped } };
       await markLibraryDirty();
       const imported = await insertInputs(additions, progress);
-      return { payload: { imported, skipped }, rebuild: true, staleViews: true };
+      return { payload: { imported, skipped }, rebuild: true };
     }
 
     case 'import-chrome': {
@@ -453,14 +484,14 @@ async function runOp(op: WorkerOp, progress: Progress): Promise<OpOutcome> {
       if (additions.length === 0) return { payload: { imported: 0, skipped } };
       await markLibraryDirty();
       const imported = await insertInputs(additions, progress);
-      return { payload: { imported, skipped }, rebuild: true, staleViews: true };
+      return { payload: { imported, skipped }, rebuild: true };
     }
 
     case 'move': {
       const destination = sanitizeName(op.destination);
       if (!destination) throw new Error('Choose a destination folder.');
       const { moved, priorFolders } = await moveWithUndo(op.ids, destination, progress);
-      return { payload: { moved, destination, priorFolders }, rebuild: true, staleViews: true };
+      return { payload: { moved, destination, priorFolders }, rebuild: true };
     }
 
     case 'corral-host': {
@@ -470,7 +501,7 @@ async function runOp(op: WorkerOp, progress: Progress): Promise<OpOutcome> {
       const ids = servingViews.idsForHost(op.host);
       if (ids.length === 0) throw new Error(`No bookmarks found on ${op.host}.`);
       const { moved, priorFolders } = await moveWithUndo(ids, destination, progress);
-      return { payload: { moved, destination, priorFolders }, rebuild: true, staleViews: true };
+      return { payload: { moved, destination, priorFolders }, rebuild: true };
     }
 
     case 'delete': {
@@ -500,7 +531,7 @@ async function runOp(op: WorkerOp, progress: Progress): Promise<OpOutcome> {
         progress(`Moved ${count(restored)} of ${count(op.moves.length)} back…`);
         await yieldToQueue();
       }
-      return { payload: { restored }, rebuild: true, staleViews: true };
+      return { payload: { restored }, rebuild: true };
     }
 
     case 'restore-records': {
@@ -515,7 +546,7 @@ async function runOp(op: WorkerOp, progress: Progress): Promise<OpOutcome> {
         progress(`Restored ${count(restored)} of ${count(op.records.length)}…`);
         await yieldToQueue();
       }
-      return { payload: { restored }, rebuild: true, staleViews: true };
+      return { payload: { restored }, rebuild: true };
     }
 
     case 'export':
@@ -538,8 +569,11 @@ async function runOp(op: WorkerOp, progress: Progress): Promise<OpOutcome> {
       const parent = parentOf(op.path);
       const newPath = parent ? `${parent}${FOLDER_SEPARATOR}${leaf}` : leaf;
       if (newPath === op.path) return { payload: { moved: 0, path: op.path, newPath, priorFolders: [] } };
+      if (newPath.startsWith(op.path + FOLDER_SEPARATOR)) {
+        throw new Error('A folder can’t be renamed into its own subtree.');
+      }
       const { moved, priorFolders } = await relocateFolder(op.path, newPath, progress);
-      return { payload: { moved, path: op.path, newPath, priorFolders }, rebuild: true, staleViews: true };
+      return { payload: { moved, path: op.path, newPath, priorFolders }, rebuild: true };
     }
 
     case 'move-folder': {
@@ -551,7 +585,7 @@ async function runOp(op: WorkerOp, progress: Progress): Promise<OpOutcome> {
       const newPath = newParent ? `${newParent}${FOLDER_SEPARATOR}${leafOf(op.path)}` : leafOf(op.path);
       if (newPath === op.path) return { payload: { moved: 0, path: op.path, newPath, priorFolders: [] } };
       const { moved, priorFolders } = await relocateFolder(op.path, newPath, progress);
-      return { payload: { moved, path: op.path, newPath, priorFolders }, rebuild: true, staleViews: true };
+      return { payload: { moved, path: op.path, newPath, priorFolders }, rebuild: true };
     }
 
     case 'delete-folder': {
@@ -610,20 +644,8 @@ async function runOp(op: WorkerOp, progress: Progress): Promise<OpOutcome> {
       return { payload: { count: servingViews ? servingViews.hostCount(op.host) : 0 } };
 
     case 'expand-host-selection': {
-      if (servingViews) return { payload: servingViews.hostExpansion(op.ids, op.options) };
-
-      // Before the in-memory index is ready, derive the same result from the
-      // live rows so the selection action remains available during a rebuild.
-      const members = await getRecordsByIds(op.ids);
-      const hostSet = new Set(members.map((record) => record.host));
-      const hosts = Array.from(hostSet).sort();
-      if (hosts.length === 0) return { payload: { hosts, ids: [] } };
-      const rows = await getFallbackPage({ ...op.options, offset: 0, limit: Number.MAX_SAFE_INTEGER });
-      const ids = rows
-        .filter((record) => hostSet.has(record.host))
-        .map((record) => record.id)
-        .filter((id): id is number => typeof id === 'number');
-      return { payload: { hosts, ids } };
+      if (!servingViews) return { payload: { hosts: [], ids: [] } };
+      return { payload: servingViews.hostExpansion(op.ids, op.options, op.scopeIds) };
     }
 
     case 'view-ids': {
@@ -709,6 +731,17 @@ const FAVICON_CONCURRENCY = 8;
 const FAVICON_TIMEOUT_MS = 8_000;
 
 let faviconRun = 0;
+let faviconProgress = { done: 0, total: 0, ok: 0, failed: 0, running: false, message: undefined as string | undefined };
+
+function reportFavicon(next: typeof faviconProgress) {
+  faviconProgress = next;
+  post({ type: 'favicon-progress', ...next });
+}
+
+function stopFavicons() {
+  faviconRun += 1;
+  if (faviconProgress.running) reportFavicon({ ...faviconProgress, running: false, message: 'Site icon update stopped.' });
+}
 
 async function fetchFavicon(source: FaviconSource, host: string, samples: string[]): Promise<FaviconRow> {
   const requestUrls = source.mode === 'chrome'
@@ -755,9 +788,10 @@ async function faviconSamples(hosts: string[], run: number) {
 
 async function buildFavicons(source: FaviconSource) {
   const run = ++faviconRun;
+  reportFavicon({ done: 0, total: 0, ok: 0, failed: 0, running: true, message: undefined });
   const views = servingViews;
   if (!views) {
-    post({ type: 'favicon-progress', done: 0, total: 0, ok: 0, failed: 0, running: false, message: 'Still indexing — try again in a moment.' });
+    reportFavicon({ done: 0, total: 0, ok: 0, failed: 0, running: false, message: 'Still indexing — try again in a moment.' });
     return;
   }
 
@@ -789,16 +823,16 @@ async function buildFavicons(source: FaviconSource) {
   let lastReport = -1;
   const report = (running: boolean) => {
     lastReport = done;
-    post({ type: 'favicon-progress', done, total, ok, failed, running });
+    reportFavicon({ done, total, ok, failed, running, message: undefined });
   };
   report(total > 0);
 
   for (let offset = 0; offset < fetchable.length; offset += FAVICON_CONCURRENCY) {
     if (run !== faviconRun) {
-      report(false);
       return;
     }
     const rows = await Promise.all(fetchable.slice(offset, offset + FAVICON_CONCURRENCY).map((host) => fetchFavicon(source, host, samples.get(host) ?? [])));
+    if (run !== faviconRun) return;
     for (const row of rows) {
       if (row.status === 'ok') ok += 1;
       else failed += 1;
@@ -811,31 +845,47 @@ async function buildFavicons(source: FaviconSource) {
   report(false);
 }
 
-const READ_ONLY_OPS = new Set(['folders', 'host-count', 'expand-host-selection', 'view-ids', 'view-total']);
+const INSTANT_READ_OPS = new Set<WorkerOp['kind']>(['folders', 'host-count', 'expand-host-selection', 'view-ids', 'view-total']);
+const MUTATING_OPS = new Set<WorkerOp['kind']>([
+  'import-file', 'import-chrome', 'move', 'corral-host', 'delete', 'restore-folders', 'restore-records',
+  'create-folder', 'rename-folder', 'move-folder', 'delete-folder',
+]);
+const coordination = new BroadcastChannel('corral-library-coordination');
+coordination.onmessage = () => {
+  // Another tab changed the library. Keep serving the last good index while a
+  // browser-wide rebuild lock either restores its finished index or builds it.
+  void rebuild();
+};
 
 /** Mutating ops run strictly serialized — a delete interleaving with a
  * streaming export would corrupt the export. Read-only ops answer instantly. */
 let opChain: Promise<void> = Promise.resolve();
 
 function handleOp(requestId: number, op: WorkerOp) {
-  const run = async () => {
+  const perform = async () => {
+    const dirtyBefore = await getDirtyRevision();
     try {
       const outcome = await runOp(op, (label) => post({ type: 'op-progress', requestId, label }));
       if (outcome.tombstoneIds && outcome.tombstoneIds.length > 0) applyTombstones(outcome.tombstoneIds);
-      if (outcome.staleViews) servingViews = null;
       post({ type: 'op-done', requestId, payload: outcome.payload });
+      if (MUTATING_OPS.has(op.kind)) coordination.postMessage({ type: 'library-changed' });
       if (outcome.rebuild) void rebuild();
     } catch (error) {
       post({ type: 'op-error', requestId, message: error instanceof Error ? error.message : 'The operation failed.' });
-      if (!READ_ONLY_OPS.has(op.kind)) {
-        // A failed mutation may have partially applied; fall back to live
-        // reads and rescan rather than serving ghost rows.
-        servingViews = null;
+      // Validation failures, exports, and duplicate scans do not touch the
+      // dirty token. Only a genuinely partial write needs recovery indexing.
+      if (MUTATING_OPS.has(op.kind) && await getDirtyRevision() !== dirtyBefore) {
+        coordination.postMessage({ type: 'library-changed' });
         void rebuild();
       }
     }
   };
-  if (READ_ONLY_OPS.has(op.kind)) void run();
+  const run = () => MUTATING_OPS.has(op.kind)
+    ? withBrowserLock(MUTATION_LOCK, 'exclusive', perform)
+    : (op.kind === 'export' || op.kind === 'find-duplicates')
+      ? withBrowserLock(MUTATION_LOCK, 'shared', perform)
+      : perform();
+  if (INSTANT_READ_OPS.has(op.kind)) void run();
   else opChain = opChain.then(run);
 }
 
@@ -846,10 +896,10 @@ const reportFatal = (error: unknown) => {
 scope.onmessage = (event) => {
   const message = event.data;
   if (message.type === 'init') void boot().catch(reportFatal);
-  if (message.type === 'rebuild') void rebuild();
+  if (message.type === 'rebuild') void rebuild(true);
   if (message.type === 'search') runSearch(message.requestId, message.query, message.limit, message.folder);
   if (message.type === 'page') void readPage(message.requestId, message.options);
   if (message.type === 'op') handleOp(message.requestId, message.op);
   if (message.type === 'favicons') void buildFavicons(message.source);
-  if (message.type === 'favicons-stop') faviconRun += 1;
+  if (message.type === 'favicons-stop') stopFavicons();
 };

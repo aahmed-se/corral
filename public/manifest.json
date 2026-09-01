@@ -28,7 +28,7 @@
     "_execute_action": {
       "suggested_key": {
         "default": "Ctrl+Shift+O",
-        "mac": "MacCtrl+Shift+O"
+        "mac": "Command+Shift+O"
       },
       "description": "Open Corral"
     }

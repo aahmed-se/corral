@@ -8,8 +8,8 @@
   },
   "scripts": {
     "dev": "vite",
-    "build": "tsc --noEmit && vite build",
-    "test": "node scripts/test-engine.mjs && node scripts/test-parse.mjs && node scripts/test-ops.mjs",
+    "build": "npm test && tsc --noEmit && vite build",
+    "test": "node scripts/test-engine.mjs && node scripts/test-parse.mjs && node scripts/test-ops.mjs && node scripts/test-manifest.mjs",
     "benchmark": "node --expose-gc scripts/benchmark.mjs 500000",
     "lint": "oxlint"
   },

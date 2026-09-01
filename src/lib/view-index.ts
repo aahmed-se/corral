@@ -159,12 +159,23 @@ function rankNames(names: string[]) {
 
 export class ViewIndex {
   private readonly data: ViewIndexData;
+  /** Start offset in `byHost` for each host id. Derived in memory. */
+  private readonly hostStartOf: Uint32Array;
   private tombstones = new Set<number>();
   private cache = new Map<string, number[]>();
   private memberCache = new Map<string, Set<number>>();
 
   constructor(data: ViewIndexData, tombstones?: Iterable<number>) {
     this.data = data;
+    this.hostStartOf = new Uint32Array(data.hostNames.length);
+    const hostIdsByName = data.hostNames.map((_, id) => id).sort((left, right) =>
+      data.hostNames[left]! < data.hostNames[right]! ? -1 : data.hostNames[left]! > data.hostNames[right]! ? 1 : 0,
+    );
+    let start = 0;
+    for (const hostId of hostIdsByName) {
+      this.hostStartOf[hostId] = start;
+      start += data.hostCounts[hostId]!;
+    }
     if (tombstones) for (const id of tombstones) this.tombstones.add(id);
   }
 
@@ -199,9 +210,11 @@ export class ViewIndex {
     const hostId = this.data.hostNames.indexOf(host);
     if (hostId === -1) return 0;
     let count = 0;
-    const { hostIdOf, ids } = this.data;
-    for (let index = 0; index < hostIdOf.length; index += 1) {
-      if (hostIdOf[index] === hostId && !this.tombstones.has(ids[index]!)) count += 1;
+    const { byHost, ids, hostCounts } = this.data;
+    const start = this.hostStartOf[hostId]!;
+    const end = start + hostCounts[hostId]!;
+    for (let step = start; step < end; step += 1) {
+      if (!this.tombstones.has(ids[byHost[step]!]!)) count += 1;
     }
     return count;
   }
@@ -234,12 +247,12 @@ export class ViewIndex {
    * query's scope that shares one of those hosts — "select all on this site
    * in the current folder". Sort/offset on the query are ignored; order is
    * irrelevant to a selection. */
-  hostExpansion(memberIds: number[], query: ViewQuery): { hosts: string[]; ids: number[] } {
-    const { ids, hostIdOf, folderIdOf, hostNames, folderNames } = this.data;
+  hostExpansion(memberIds: number[], query: ViewQuery, scopeIds?: Iterable<number>): { hosts: string[]; ids: number[] } {
+    const { ids, hostIdOf, folderIdOf, hostNames, folderNames, hostCounts, byHost } = this.data;
     const hostIds = new Set<number>();
     for (const memberId of memberIds) {
       const position = this.positionOf(memberId);
-      if (position !== -1) hostIds.add(hostIdOf[position]!);
+      if (position !== -1 && !this.tombstones.has(memberId)) hostIds.add(hostIdOf[position]!);
     }
     if (hostIds.size === 0) return { hosts: [], ids: [] };
 
@@ -253,14 +266,20 @@ export class ViewIndex {
       }
     }
 
+    const allowed = scopeIds ? new Set(scopeIds) : null;
     const expanded: number[] = [];
-    for (let position = 0; position < ids.length; position += 1) {
-      if (!hostIds.has(hostIdOf[position]!)) continue;
-      if (wanted && !wanted.has(folderIdOf[position]!)) continue;
-      const id = ids[position]!;
-      if (this.tombstones.has(id)) continue;
-      expanded.push(id);
+    for (const hostId of hostIds) {
+      const start = this.hostStartOf[hostId]!;
+      const end = start + hostCounts[hostId]!;
+      for (let step = start; step < end; step += 1) {
+        const position = byHost[step]!;
+        if (wanted && !wanted.has(folderIdOf[position]!)) continue;
+        const id = ids[position]!;
+        if ((allowed && !allowed.has(id)) || this.tombstones.has(id)) continue;
+        expanded.push(id);
+      }
     }
+    expanded.sort((left, right) => left - right);
     const hosts = Array.from(hostIds, (hostId) => hostNames[hostId]!).sort();
     return { hosts, ids: expanded };
   }
@@ -284,15 +303,16 @@ export class ViewIndex {
   idsForHost(host: string): number[] {
     const hostId = this.data.hostNames.indexOf(host);
     if (hostId === -1) return [];
-    const { byDate, hostIdOf, ids } = this.data;
-    const list: number[] = [];
-    for (let step = byDate.length - 1; step >= 0; step -= 1) {
-      const position = byDate[step]!;
-      if (hostIdOf[position] !== hostId) continue;
-      const id = ids[position]!;
-      if (!this.tombstones.has(id)) list.push(id);
+    const { byHost, ids, dates, hostCounts } = this.data;
+    const start = this.hostStartOf[hostId]!;
+    const end = start + hostCounts[hostId]!;
+    const positions: number[] = [];
+    for (let step = start; step < end; step += 1) {
+      const position = byHost[step]!;
+      if (!this.tombstones.has(ids[position]!)) positions.push(position);
     }
-    return list;
+    positions.sort((left, right) => dates[right]! - dates[left]! || ids[right]! - ids[left]!);
+    return positions.map((position) => ids[position]!);
   }
 
   private materialize(query: ViewQuery): number[] {

@@ -33,6 +33,14 @@ assert(store.search('reading hamlet', 10).ids.join(',') === '1', 'multi-term AND
 store.tombstone([3]);
 assert(store.search('flix', 10).ids.length === 0, 'tombstoned rows drop from search');
 
+// Host text occurs inside the URL too. Its dedicated field must come first so
+// real site matches outrank a coincidental folder-name match.
+const rankBuilder = new ShardBuilder();
+rankBuilder.add({ id: 100, title: 'Daily news', url: 'https://nytimes.com/world', host: 'nytimes.com', folder: 'Reading' });
+rankBuilder.add({ id: 101, title: 'Clipping', url: 'https://example.com/item', host: 'example.com', folder: 'Nytimes clippings' });
+rankBuilder.add({ id: 102, title: 'Reference', url: 'https://example.com/?source=nytimes', host: 'example.com', folder: 'Reading' });
+assert(ShardStore.fromShards(rankBuilder.finish()).search('nytimes', 10).ids.join(',') === '100,101,102', 'site matches outrank folder and URL matches');
+
 // --- view ordering -----------------------------------------------------------
 // Folders: Work, Work / Deep, Play. Hosts: a.com, b.com.
 const folderNames = ['Work', 'Work / Deep', 'Play'];
@@ -76,6 +84,7 @@ const folderHostExpansion = index.hostExpansion([1], q({ view: 'folder', folder:
 assert(folderHostExpansion.ids.join(',') === '1,5', 'host expansion stays inside the folder subtree');
 const exactFolderHostExpansion = index.hostExpansion([1], q({ view: 'folder', folder: 'Work' }));
 assert(exactFolderHostExpansion.ids.join(',') === '1', 'host expansion respects an exact folder scope');
+assert(index.hostExpansion([1], q(), [3, 5]).ids.join(',') === '3,5', 'host expansion respects the active result id scope');
 assert(index.hostExpansion([999], q()).ids.length === 0, 'host expansion ignores unknown members');
 
 // Tombstones shrink everything.
