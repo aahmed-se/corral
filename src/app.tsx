@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react';
 import {
   AlignJustify,
+  CheckSquare,
   Copy,
   CopyMinus,
   CornerLeftUp,
@@ -24,6 +25,7 @@ import {
   Zap,
 } from 'lucide-react';
 import { db, FOLDER_SEPARATOR, UNFILED, type BookmarkRecord, type SortMode } from './lib/db.ts';
+import { openableBookmarkUrl } from './lib/bookmark-url.ts';
 import { BookmarkList } from './ui/bookmark-list.tsx';
 import { ContextMenu, type MenuItem } from './ui/context-menu.tsx';
 import { ConfirmDialog, ExportDialog, FolderPickerDialog, ImportDialog, NameDialog } from './ui/dialogs.tsx';
@@ -37,6 +39,10 @@ type PickerIntent =
 
 type MenuState = { x: number; y: number; record: BookmarkRecord; targetIds: number[] };
 
+/** Async facts the bookmark menu shows once the worker answers: how many
+ * bookmarks share the host library-wide, and which of them are in this view. */
+type MenuFacts = { hostTotal: number | null; viewIds: number[] | null };
+
 type FolderMenuState = { x: number; y: number; node: TreeNode };
 
 type NameIntent =
@@ -48,6 +54,16 @@ const DENSITIES: Array<{ id: Density; label: string; icon: React.ReactNode }> = 
   { id: 'cozy', label: 'Cozy rows', icon: <List /> },
   { id: 'compact', label: 'Compact rows', icon: <AlignJustify /> },
 ];
+
+const SORT_LABEL: Record<SortMode, string> = { newest: 'Newest first', oldest: 'Oldest first', title: 'Title A→Z', site: 'Site A→Z' };
+
+/** Opens up to `limit` records in new tabs — dozens at once is a popup-blocker fight. */
+function openRecords(records: Array<BookmarkRecord | undefined>, limit = 15) {
+  for (const record of records.slice(0, limit)) {
+    const url = record ? openableBookmarkUrl(record.url) : null;
+    if (url) window.open(url, '_blank', 'noopener,noreferrer');
+  }
+}
 
 function formatBytes(bytes: number) {
   if (!Number.isFinite(bytes) || bytes <= 0) return '0 KB';
@@ -61,7 +77,7 @@ export function App() {
   const clearSelection = corral.clearSelection;
   const selectedCount = corral.selected.size;
   const [menu, setMenu] = useState<MenuState | null>(null);
-  const [menuHostCount, setMenuHostCount] = useState<number | null>(null);
+  const [menuFacts, setMenuFacts] = useState<MenuFacts>({ hostTotal: null, viewIds: null });
   const [folderMenu, setFolderMenu] = useState<FolderMenuState | null>(null);
   const [picker, setPicker] = useState<PickerIntent | null>(null);
   const [nameIntent, setNameIntent] = useState<NameIntent | null>(null);
@@ -79,10 +95,14 @@ export function App() {
         clearSelection();
         return;
       }
+      const inField = event.target instanceof Element && event.target.closest('input, textarea, select, [contenteditable], [role="dialog"], [role="menu"]');
+      if (event.key === '/' && !inField && !overlayOpen && !event.metaKey && !event.ctrlKey && !event.altKey) {
+        event.preventDefault();
+        searchRef.current?.focus();
+        return;
+      }
       if (!(event.metaKey || event.ctrlKey) || event.key.toLowerCase() !== 'a') return;
-      const target = event.target;
-      if (target instanceof Element && target.closest('input, textarea, select, [contenteditable], [role="dialog"], [role="menu"]')) return;
-      if (overlayOpen) return;
+      if (inField || overlayOpen) return;
       event.preventDefault();
       void selectAllRows();
     };
@@ -131,44 +151,72 @@ export function App() {
 
   const onRowContextMenu = useCallback((event: React.MouseEvent, record: BookmarkRecord) => {
     event.preventDefault();
-    const targetIds = record.id && corral.selected.has(record.id) ? Array.from(corral.selected) : [record.id!];
+    if (!record.id) return;
+    const id = record.id;
+    const targetIds = corral.selected.has(id) ? Array.from(corral.selected) : [id];
     setMenu({ x: event.clientX, y: event.clientY, record, targetIds });
-    setMenuHostCount(null);
-    void corral.hostCount(record.host).then(setMenuHostCount).catch(() => setMenuHostCount(null));
+    setMenuFacts({ hostTotal: null, viewIds: null });
+    void corral.hostCount(record.host).then((hostTotal) => setMenuFacts((facts) => ({ ...facts, hostTotal }))).catch(() => undefined);
+    void corral.hostMatchesInView(id).then((viewIds) => setMenuFacts((facts) => ({ ...facts, viewIds }))).catch(() => undefined);
   }, [corral]);
+
+  const inFolderView = corral.selection.view === 'folder';
+  const scopeHint = corral.isSearching ? 'in results' : inFolderView ? 'in this folder' : 'everywhere';
 
   const menuItems: MenuItem[] = useMemo(() => {
     if (!menu) return [];
     const { record, targetIds } = menu;
     const many = targetIds.length > 1;
-    const hostLabel = menuHostCount === null
-      ? `Corral every bookmark on ${record.host} into a folder…`
-      : `Corral all ${countLabel(menuHostCount)} on ${record.host} into a folder…`;
-    return [
+    const { hostTotal, viewIds } = menuFacts;
+    const viewCount = viewIds?.length ?? null;
+    const items: MenuItem[] = [
       { kind: 'item', label: many ? `Open ${countLabel(targetIds.length)}` : 'Open', icon: <ExternalLink />, onSelect: () => {
-        // Opening dozens of tabs at once is a popup-blocker fight; cap it.
-        void (async () => {
-          const rows = targetIds.length === 1 ? [record] : await db.bookmarks.bulkGet(targetIds.slice(0, 15));
-          for (const item of rows) if (item) window.open(item.url, '_blank', 'noopener,noreferrer');
-        })();
+        void (targetIds.length === 1 ? Promise.resolve([record]) : db.bookmarks.bulkGet(targetIds)).then((rows) => openRecords(rows));
       } },
       { kind: 'item', label: 'Copy URL', icon: <Copy />, onSelect: () => {
         void navigator.clipboard.writeText(record.url);
         corral.setToast({ message: 'URL copied' });
       } },
       { kind: 'separator' },
-      { kind: 'item', label: hostLabel, icon: <Lasso />, onSelect: () => {
-        setPicker({ kind: 'corral', host: record.host, count: menuHostCount ?? 0 });
-      } },
-      { kind: 'item', label: many ? `Move ${countLabel(targetIds.length)}…` : 'Move to folder…', icon: <FolderInput />, onSelect: () => {
-        setPicker({ kind: 'move', ids: targetIds, label: many ? countLabel(targetIds.length) : record.title });
-      } },
-      { kind: 'separator' },
-      { kind: 'item', label: many ? `Remove ${countLabel(targetIds.length)}` : 'Remove', icon: <Trash2 />, danger: true, onSelect: () => {
-        void corral.deleteIds(targetIds);
+      // Site actions. Selecting is the flexible one — the selection bar and
+      // drag-and-drop take it from there; the library-wide roundup remains for
+      // the "everything from this site in one place" case.
+      { kind: 'item', label: `Show all from ${record.host}`, icon: <Search />, onSelect: () => {
+        corral.setQuery(record.host);
+        searchRef.current?.focus();
       } },
     ];
-  }, [corral, menu, menuHostCount]);
+    if (viewCount === null || viewCount > 1) {
+      items.push({
+        kind: 'item',
+        label: viewCount === null ? `Select all from ${record.host}` : `Select all ${viewCount.toLocaleString()} from ${record.host}`,
+        hint: scopeHint,
+        icon: <CheckSquare />,
+        onSelect: () => {
+          if (viewIds) corral.selectIds(viewIds);
+          else void corral.hostMatchesInView(record.id!).then(corral.selectIds).catch(() => undefined);
+        },
+      });
+    }
+    items.push({ kind: 'separator' });
+    items.push({ kind: 'item', label: many ? `Move ${countLabel(targetIds.length)} to folder…` : 'Move to folder…', icon: <FolderInput />, onSelect: () => {
+      setPicker({ kind: 'move', ids: targetIds, label: many ? countLabel(targetIds.length) : record.title });
+    } });
+    if (hostTotal === null || hostTotal > 1) {
+      items.push({
+        kind: 'item',
+        label: hostTotal === null ? `Corral every bookmark on ${record.host}…` : `Corral all ${hostTotal.toLocaleString()} on ${record.host}…`,
+        hint: 'whole library',
+        icon: <Lasso />,
+        onSelect: () => setPicker({ kind: 'corral', host: record.host, count: hostTotal ?? 0 }),
+      });
+    }
+    items.push({ kind: 'separator' });
+    items.push({ kind: 'item', label: many ? `Remove ${countLabel(targetIds.length)}` : 'Remove', icon: <Trash2 />, danger: true, onSelect: () => {
+      void corral.deleteIds(targetIds);
+    } });
+    return items;
+  }, [corral, menu, menuFacts, scopeHint]);
 
   const folderMenuItems: MenuItem[] = useMemo(() => {
     if (!folderMenu) return [];
@@ -188,75 +236,109 @@ export function App() {
     return items;
   }, [corral, folderMenu]);
 
-  const sortLabel: Record<SortMode, string> = { newest: 'Newest', oldest: 'Oldest', title: 'Title A–Z', site: 'By site' };
-
   const heading = corral.isSearching
     ? `“${corral.deferredQuery}”`
     : corral.selection.view === 'all'
       ? 'All bookmarks'
       : corral.selection.folder;
-  const searchScope = corral.isSearching && corral.selection.view === 'folder' ? ` · in ${corral.selection.folder} and subfolders` : '';
+  const searchScope = corral.isSearching && inFolderView ? ` · in ${corral.selection.folder}` : '';
   const subtitle = corral.isSearching
     ? corral.search.pending
       ? `Searching…${searchScope}`
-      : `${corral.search.total.toLocaleString()} matches in ${corral.search.elapsedMs < 1 ? '<1' : corral.search.elapsedMs.toFixed(1)} ms${corral.search.truncated ? ' · top results' : ''}${searchScope}`
-    : corral.selection.view === 'folder'
+      : `${corral.search.total.toLocaleString()} matches · ${corral.search.elapsedMs < 1 ? '<1' : corral.search.elapsedMs.toFixed(1)} ms${corral.search.truncated ? ' · top results' : ''}${searchScope}`
+    : inFolderView
       ? `${countLabel(corral.viewTotal, 'link')} · ${countLabel(corral.folderEntries.length, 'folder')}`
       : countLabel(corral.viewTotal, 'link');
 
+  const showHostColumn = corral.density !== 'roomy';
+
   return (
     <div className="shell" data-busy={corral.busy || undefined}>
-      <aside className="sidebar">
-        <div className="brand">
-          <span className="brand-mark"><Lasso /></span>
-          <span className="brand-name">Corral</span>
+      <header className="topbar">
+        <div className="logo" aria-label="Corral">
+          <Lasso aria-hidden="true" />
+          <span>CORR<em>AL</em></span>
         </div>
-        <FolderTree
-          folders={corral.folders}
-          total={corral.stats.total}
-          selection={corral.selection}
-          onSelect={corral.chooseView}
-          drag={drag}
-          onNewFolder={() => setNameIntent({ kind: 'create', parent: '' })}
-          onFolderContextMenu={onFolderContextMenu}
-          onFolderPointerDown={onFolderPointerDown}
-        />
-        <div className="side-status">
-          <StatusLine corral={corral} />
-          <FaviconLine corral={corral} />
-          <div className="side-meta">
-            <span>{formatBytes(corral.storageUsage)} on device</span>
-            <span>Local only</span>
+
+        <label className="search">
+          <Search className="search-icon" />
+          <input
+            ref={searchRef}
+            value={corral.query}
+            onChange={(event) => corral.setQuery(event.target.value)}
+            placeholder={corral.stats.total > 0 ? `Search titles, URLs, folders… (${corral.stats.total.toLocaleString()} bookmarks)` : 'Search titles, URLs, folders…'}
+            spellCheck={false}
+            autoComplete="off"
+            onKeyDown={(event) => {
+              if (event.key === 'Escape') {
+                corral.setQuery('');
+                event.currentTarget.blur();
+              }
+            }}
+          />
+          {corral.search.pending ? <Loader2 className="spin" /> : corral.query ? (
+            <button className="icon-button small" aria-label="Clear search" onClick={() => corral.setQuery('')}><X /></button>
+          ) : (
+            <kbd>/</kbd>
+          )}
+        </label>
+
+        <div className="topbar-stats" aria-label="Library">
+          <div className="stat-chip"><strong>{corral.stats.total.toLocaleString()}</strong> BOOKMARKS</div>
+          <div className="stat-chip"><strong>{corral.folders.length.toLocaleString()}</strong> FOLDERS</div>
+          <div className="stat-chip"><strong>{formatBytes(corral.storageUsage)}</strong> ON DEVICE</div>
+        </div>
+
+        <div className="topbar-btns">
+          <button
+            className="tbtn"
+            title="Remove duplicate links"
+            disabled={corral.busy || corral.stats.total === 0}
+            onClick={() => void runDedup()}
+          >
+            <CopyMinus /> <span className="tbtn-text">Find dups</span>
+          </button>
+          <button className="tbtn" title="Export" onClick={() => setExportOpen(true)}><Download /> <span className="tbtn-text">Export</span></button>
+          <button className="tbtn primary" onClick={() => setImportOpen(true)}><Plus /> <span className="tbtn-text">Import</span></button>
+        </div>
+      </header>
+
+      <div className="main">
+        <aside className="sidebar">
+          <FolderTree
+            folders={corral.folders}
+            total={corral.stats.total}
+            selection={corral.selection}
+            onSelect={corral.chooseView}
+            drag={drag}
+            onNewFolder={() => setNameIntent({ kind: 'create', parent: '' })}
+            onFolderContextMenu={onFolderContextMenu}
+            onFolderPointerDown={onFolderPointerDown}
+          />
+          <div className="side-status">
+            <StatusLine corral={corral} />
+            <FaviconLine corral={corral} />
+            <div className="side-meta">
+              <span>IndexedDB</span>
+              <span>Local only</span>
+            </div>
           </div>
-        </div>
-      </aside>
+        </aside>
 
-      <main className="main">
-        <header className="toolbar">
-          <label className="search">
-            <Search className="search-icon" />
-            <input
-              ref={searchRef}
-              value={corral.query}
-              onChange={(event) => corral.setQuery(event.target.value)}
-              placeholder={corral.stats.total > 0 ? `Search ${corral.stats.total.toLocaleString()} bookmarks` : 'Search'}
-              spellCheck={false}
-              autoComplete="off"
-              onKeyDown={(event) => {
-                if (event.key === 'Escape') {
-                  corral.setQuery('');
-                  event.currentTarget.blur();
-                }
-              }}
-            />
-            {corral.search.pending ? <Loader2 className="spin" /> : corral.query ? (
-              <button className="icon-button" aria-label="Clear search" onClick={() => corral.setQuery('')}><X /></button>
-            ) : (
-              <kbd>/</kbd>
-            )}
-          </label>
-
-          <div className="toolbar-actions">
+        <section className={`content density-${corral.density}`}>
+          <div className="toolbar">
+            <div className="view-title">
+              <h1 title={heading}>{heading}</h1>
+              <span>{subtitle}</span>
+            </div>
+            <span className="tlabel">Sort</span>
+            <select className="tsel" value={corral.sort} aria-label="Sort" onChange={(event) => corral.changeSort(event.target.value as SortMode)}>
+              {(Object.keys(SORT_LABEL) as SortMode[]).map((mode) => (
+                <option key={mode} value={mode}>{SORT_LABEL[mode]}</option>
+              ))}
+            </select>
+            <div className="toolbar-sep" />
+            <span className="tlabel">Rows</span>
             <div className="segmented" role="group" aria-label="Row density">
               {DENSITIES.map(({ id, label, icon }) => (
                 <button
@@ -271,53 +353,45 @@ export function App() {
                 </button>
               ))}
             </div>
-            <select className="sort-select" value={corral.sort} aria-label="Sort" onChange={(event) => corral.changeSort(event.target.value as SortMode)}>
-              {(Object.keys(sortLabel) as SortMode[]).map((mode) => (
-                <option key={mode} value={mode}>{sortLabel[mode]}</option>
-              ))}
-            </select>
-            <button
-              className="icon-button"
-              title="Remove duplicate links"
-              aria-label="Remove duplicate links"
-              disabled={corral.busy || corral.stats.total === 0}
-              onClick={() => void runDedup()}
-            >
-              <CopyMinus />
+          </div>
+
+          {/* Always present, so the actions have a fixed home; they enable as soon as anything is selected. */}
+          <div className={`bulk-bar${selectedCount === 0 ? ' empty' : ''}`} role="region" aria-label="Selection">
+            <span className="sel-count">{selectedCount.toLocaleString()} selected</span>
+            {selectedCount === 0 ? (
+              <button className="tbtn ghost sm" disabled={corral.itemCount === 0} title="Select every row in this list (⌘A)" onClick={() => void corral.selectAllRows()}>
+                <CheckSquare /> Select all
+              </button>
+            ) : corral.baseUrlSelectionPending ? (
+              <button className="tbtn ghost sm" disabled>Counting…</button>
+            ) : corral.canSelectAllWithBaseUrl ? (
+              <button className="tbtn ghost sm" onClick={corral.selectAllWithBaseUrl}>
+                + {corral.baseUrlMatchCount.toLocaleString()} with {corral.baseUrlHostCount === 1 ? 'this site' : 'these sites'}
+              </button>
+            ) : null}
+            <span className="bulk-spacer" />
+            <button className="tbtn sm" disabled={selectedCount === 0} onClick={() => setPicker({ kind: 'move', ids: Array.from(corral.selected), label: countLabel(selectedCount) })}>
+              <FolderInput /> Move to…
             </button>
-            <button className="icon-button" title="Export" aria-label="Export" onClick={() => setExportOpen(true)}><Download /></button>
-            <button className="button primary" onClick={() => setImportOpen(true)}><Plus /> Import</button>
+            <button className="tbtn danger sm" disabled={selectedCount === 0} onClick={() => void corral.deleteIds(Array.from(corral.selected))}>
+              <Trash2 /> Delete
+            </button>
+            <button className="tbtn sm" disabled={selectedCount === 0} onClick={corral.clearSelection}><X /> Deselect</button>
           </div>
-        </header>
 
-        <div className="view-heading">
-          <div>
-            <h1 title={heading}>{heading}</h1>
-            <span>{subtitle}</span>
+          <div className="list-header" aria-hidden="true">
+            <span className="col chk" />
+            <span className="col fav" />
+            <span className="col title">Title / URL</span>
+            {showHostColumn && <span className="col host">Site</span>}
+            <span className="col folder">Folder</span>
+            <span className="col date">Added</span>
+            <span className="col acts" />
           </div>
-          {corral.selected.size > 0 && (
-            <div className="selection-bar">
-              <strong>{corral.selected.size.toLocaleString()} selected</strong>
-              {corral.baseUrlSelectionPending ? (
-                <button className="button ghost" disabled>Counting base URL matches…</button>
-              ) : corral.canSelectAllWithBaseUrl ? (
-                <button className="button ghost" onClick={corral.selectAllWithBaseUrl}>
-                  Select all {corral.baseUrlMatchCount.toLocaleString()} with {corral.baseUrlHostCount === 1 ? 'this base URL' : 'these base URLs'}
-                </button>
-              ) : null}
-              <button className="button ghost" onClick={corral.clearSelection}>Clear</button>
-              <button className="button" onClick={() => setPicker({ kind: 'move', ids: Array.from(corral.selected), label: countLabel(corral.selected.size) })}>
-                <FolderInput /> Move
-              </button>
-              <button className="button danger" onClick={() => void corral.deleteIds(Array.from(corral.selected))}>
-                <Trash2 /> Remove
-              </button>
-            </div>
-          )}
-        </div>
 
-        <BookmarkList corral={corral} onRowPointerDown={onRowPointerDown} onRowContextMenu={onRowContextMenu} onImport={() => setImportOpen(true)} />
-      </main>
+          <BookmarkList corral={corral} onRowPointerDown={onRowPointerDown} onRowContextMenu={onRowContextMenu} onImport={() => setImportOpen(true)} />
+        </section>
+      </div>
 
       {drag && (
         <div className="drag-ghost" style={{ transform: `translate(${drag.x + 14}px, ${drag.y + 10}px)` }}>
@@ -333,7 +407,9 @@ export function App() {
       {picker && (
         <FolderPickerDialog
           title={picker.kind === 'corral' ? `Corral ${picker.host}` : `Move ${picker.label}`}
-          subtitle={picker.kind === 'corral' ? `${countLabel(picker.count)} across your library will move into one folder.` : 'Pick an existing folder or create a new one.'}
+          subtitle={picker.kind === 'corral'
+            ? `${picker.count > 0 ? countLabel(picker.count) : 'Every bookmark'} on ${picker.host}, from every folder in your library, will move into one folder.`
+            : 'Pick an existing folder or create a new one.'}
           folders={corral.folders}
           suggested={picker.kind === 'corral' ? picker.host : undefined}
           confirmLabel={picker.kind === 'corral' ? 'Corral them' : 'Move'}
@@ -439,23 +515,37 @@ function FaviconLine({ corral }: { corral: Corral }) {
   );
 }
 
-function StatusLine({ corral }: { corral: ReturnType<typeof useCorral> }) {
+const PHASE_LABEL = { scanning: 'Indexing', analyzing: 'Sorting', saving: 'Saving' } as const;
+
+function StatusLine({ corral }: { corral: Corral }) {
   const { index } = corral;
   if (index.status === 'error') {
     return (
       <div className="status-line error">
         <span>{index.message || 'Indexing failed'}</span>
-        <button className="button ghost" onClick={corral.requestRebuild}>Rebuild</button>
+        <button className="tbtn ghost sm" onClick={corral.requestRebuild}>Rebuild</button>
       </div>
     );
   }
   if (index.status === 'indexing' || index.status === 'starting') {
-    const label = index.status === 'starting' ? 'Opening library' : index.phase === 'scanning' ? 'Indexing' : index.phase === 'analyzing' ? 'Sorting' : 'Saving';
+    const label = index.status === 'starting' ? 'Opening library' : PHASE_LABEL[index.phase];
     const share = index.total > 0 ? Math.round((index.done / index.total) * 100) : 0;
     return (
       <div className="status-line">
         <Loader2 className="spin" />
         <span>{label}{index.total > 0 ? ` · ${share}%` : '…'}</span>
+        <span className="status-meter"><i style={{ width: `${share}%` }} /></span>
+      </div>
+    );
+  }
+  if (index.background) {
+    // Quiet compaction: the rows on screen are already current.
+    const { done, total } = index.background;
+    const share = total > 0 ? Math.round((done / total) * 100) : 0;
+    return (
+      <div className="status-line" title="Compacting the index in the background — everything stays usable.">
+        <Loader2 className="spin" />
+        <span>Compacting · {share}%</span>
         <span className="status-meter"><i style={{ width: `${share}%` }} /></span>
       </div>
     );

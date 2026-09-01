@@ -119,10 +119,18 @@ export class ShardBuilder {
 export class ShardStore {
   private shards: ShardData[] = [];
   private tombstones = new Set<number>();
+  /** Shards `[0, baseShardCount)` come from the last full build; the rest are
+   * delta shards holding records re-indexed since (a move rewrites a record's
+   * folder text). For every id in a delta shard, `latestShardOf` names the
+   * shard with its current text; the same id's entries elsewhere are stale. */
+  private baseShardCount = 0;
+  private latestShardOf = new Map<number, number>();
 
-  static fromShards(shards: ShardData[], tombstones?: Iterable<number>) {
+  static fromShards(shards: ShardData[], tombstones?: Iterable<number>, baseShardCount = shards.length) {
     const store = new ShardStore();
     store.shards = shards;
+    store.baseShardCount = Math.max(0, Math.min(baseShardCount, shards.length));
+    for (let index = store.baseShardCount; index < shards.length; index += 1) store.registerDelta(index);
     if (tombstones) store.tombstone(tombstones);
     return store;
   }
@@ -135,8 +143,54 @@ export class ShardStore {
     return Uint32Array.from(this.tombstones);
   }
 
+  get shardCount() {
+    return this.shards.length;
+  }
+
+  get baseShards() {
+    return this.baseShardCount;
+  }
+
+  /** Distinct records currently served from a delta shard. */
+  get deltaRecordCount() {
+    return this.latestShardOf.size;
+  }
+
+  shardAt(index: number): ShardData | undefined {
+    return this.shards[index];
+  }
+
   tombstone(ids: Iterable<number>) {
     for (const id of ids) this.tombstones.add(id);
+  }
+
+  /** Undoes tombstones; the records' text is still in their shards. */
+  revive(ids: Iterable<number>) {
+    for (const id of ids) this.tombstones.delete(id);
+  }
+
+  /** Re-indexes records whose searchable text changed, as new delta shards.
+   * Returns the shards appended so the caller can persist them. */
+  reindex(records: SearchableRecord[]) {
+    if (records.length === 0) return [];
+    const builder = new ShardBuilder();
+    for (const record of records) builder.add(record);
+    const appended = builder.finish();
+    for (const shard of appended) {
+      this.shards.push(shard);
+      this.registerDelta(this.shards.length - 1);
+    }
+    return appended;
+  }
+
+  private registerDelta(shardIndex: number) {
+    for (const id of this.shards[shardIndex]!.ids) this.latestShardOf.set(id, shardIndex);
+  }
+
+  private isStale(id: number, shardIndex: number) {
+    if (this.latestShardOf.size === 0) return false;
+    const latest = this.latestShardOf.get(id);
+    return latest !== undefined && latest !== shardIndex;
   }
 
   /** `accept` scopes the search (e.g. to one folder's ids). It runs inside the
@@ -175,7 +229,7 @@ export class ShardStore {
         const end = starts[recordIndex + 1]! - RECORD_SEP.length;
         const id = ids[recordIndex]!;
 
-        if (!this.tombstones.has(id) && (!accept || accept(id))) {
+        if (!this.tombstones.has(id) && !this.isStale(id, shardIndex) && (!accept || accept(id))) {
           const record = text.slice(start, end);
           let matchesAll = true;
           for (const term of rest) {

@@ -42,7 +42,11 @@ export type LibraryStats = {
   total: number;
   hosts: number;
   folders: number;
+  /** Persisted shard rows, delta shards included. */
   shards: number;
+  /** Shards written by the last full build; the rest are delta shards. Absent
+   * on rows written before delta shards existed (treated as `shards`). */
+  baseShards?: number;
   indexedAt: number;
   buildMs: number;
 };

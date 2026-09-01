@@ -158,15 +158,20 @@ function rankNames(names: string[]) {
 }
 
 export class ViewIndex {
-  private readonly data: ViewIndexData;
+  /** Mutable: moves and folder renames are applied in place (see
+   * `moveRecords` / `remapFolders`) so a mutation never forces a rescan. The
+   * host arrays stay fixed — `hostCounts` doubles as the `byHost` span table. */
+  private data: ViewIndexData;
   /** Start offset in `byHost` for each host id. Derived in memory. */
   private readonly hostStartOf: Uint32Array;
   private tombstones = new Set<number>();
   private cache = new Map<string, number[]>();
   private memberCache = new Map<string, Set<number>>();
+  private folderIdByName: Map<string, number>;
 
   constructor(data: ViewIndexData, tombstones?: Iterable<number>) {
     this.data = data;
+    this.folderIdByName = new Map(data.folderNames.map((name, id) => [name, id]));
     this.hostStartOf = new Uint32Array(data.hostNames.length);
     const hostIdsByName = data.hostNames.map((_, id) => id).sort((left, right) =>
       data.hostNames[left]! < data.hostNames[right]! ? -1 : data.hostNames[left]! > data.hostNames[right]! ? 1 : 0,
@@ -176,13 +181,132 @@ export class ViewIndex {
       this.hostStartOf[hostId] = start;
       start += data.hostCounts[hostId]!;
     }
-    if (tombstones) for (const id of tombstones) this.tombstones.add(id);
+    if (tombstones) this.tombstone(tombstones);
   }
 
+  /** Number of records the index was built over, tombstoned ones included. */
+  get size() {
+    return this.data.ids.length;
+  }
+
+  get tombstoneCount() {
+    return this.tombstones.size;
+  }
+
+  /** The current arrays, for persistence. Callers must not mutate them. */
+  exportData(): ViewIndexData {
+    return this.data;
+  }
+
+  /** Hides records. Folder counts follow immediately; host counts stay at
+   * build-time values because they also describe the `byHost` layout. */
   tombstone(ids: Iterable<number>) {
-    for (const id of ids) this.tombstones.add(id);
+    const { folderIdOf, folderCounts } = this.data;
+    for (const id of ids) {
+      if (this.tombstones.has(id)) continue;
+      this.tombstones.add(id);
+      const position = this.positionOf(id);
+      if (position !== -1) {
+        const folderId = folderIdOf[position]!;
+        folderCounts[folderId] = folderCounts[folderId]! - 1;
+      }
+    }
     this.cache.clear();
     this.memberCache.clear();
+  }
+
+  /** Whether the index holds this record (live or tombstoned). */
+  has(id: number) {
+    return this.positionOf(id) !== -1;
+  }
+
+  /** Brings tombstoned records back (undo of a delete). Returns the ids that
+   * were actually revived — ids the index no longer holds are left out. */
+  revive(ids: Iterable<number>) {
+    const { folderIdOf, folderCounts } = this.data;
+    const revived: number[] = [];
+    for (const id of ids) {
+      if (!this.tombstones.has(id)) continue;
+      const position = this.positionOf(id);
+      if (position === -1) continue;
+      this.tombstones.delete(id);
+      const folderId = folderIdOf[position]!;
+      folderCounts[folderId] = folderCounts[folderId]! + 1;
+      revived.push(id);
+    }
+    if (revived.length > 0) {
+      this.cache.clear();
+      this.memberCache.clear();
+    }
+    return revived;
+  }
+
+  /** Re-files records in place. Ids the index does not hold (never indexed, or
+   * already tombstoned) are skipped. Returns how many records changed folder. */
+  moveRecords(moves: Iterable<{ id: number; folder: string }>) {
+    let changed = 0;
+    for (const { id, folder } of moves) {
+      if (this.tombstones.has(id)) continue;
+      const position = this.positionOf(id);
+      if (position === -1) continue;
+      const to = this.folderId(folder);
+      const from = this.data.folderIdOf[position]!;
+      if (from === to) continue;
+      this.data.folderIdOf[position] = to;
+      this.data.folderCounts[from] = this.data.folderCounts[from]! - 1;
+      this.data.folderCounts[to] = this.data.folderCounts[to]! + 1;
+      changed += 1;
+    }
+    if (changed > 0) {
+      this.cache.clear();
+      this.memberCache.clear();
+    }
+    return changed;
+  }
+
+  /** Renames folders in place. `rename` returns a folder's new full path, or
+   * null to leave it alone. Folders that end up sharing a name are merged, so
+   * renaming "A" to an existing "B" simply pours A into B. */
+  remapFolders(rename: (folder: string) => string | null) {
+    const { folderNames, folderIdOf, folderCounts } = this.data;
+    const nextNames: string[] = [];
+    const nextIdByName = new Map<string, number>();
+    const idMap = new Uint32Array(folderNames.length);
+    let touched = false;
+    for (let id = 0; id < folderNames.length; id += 1) {
+      const name = rename(folderNames[id]!) ?? folderNames[id]!;
+      if (name !== folderNames[id]) touched = true;
+      let nextId = nextIdByName.get(name);
+      if (nextId === undefined) {
+        nextId = nextNames.length;
+        nextIdByName.set(name, nextId);
+        nextNames.push(name);
+      } else {
+        touched = true;
+      }
+      idMap[id] = nextId;
+    }
+    if (!touched) return 0;
+    const nextCounts = new Uint32Array(nextNames.length);
+    for (let id = 0; id < folderNames.length; id += 1) nextCounts[idMap[id]!] = nextCounts[idMap[id]!]! + folderCounts[id]!;
+    for (let index = 0; index < folderIdOf.length; index += 1) folderIdOf[index] = idMap[folderIdOf[index]!]!;
+    this.data = { ...this.data, folderNames: nextNames, folderCounts: nextCounts };
+    this.folderIdByName = nextIdByName;
+    this.cache.clear();
+    this.memberCache.clear();
+    return folderIdOf.length;
+  }
+
+  private folderId(name: string) {
+    const existing = this.folderIdByName.get(name);
+    if (existing !== undefined) return existing;
+    const id = this.data.folderNames.length;
+    this.data.folderNames.push(name);
+    const counts = new Uint32Array(id + 1);
+    counts.set(this.data.folderCounts);
+    this.data = { ...this.data, folderCounts: counts };
+    this.folderIdByName.set(name, id);
+    return id;
   }
 
   page(query: ViewQuery, offset: number, limit: number): { ids: number[]; total: number } {
@@ -194,15 +318,23 @@ export class ViewIndex {
     return this.materialize(query).length;
   }
 
-  /** Every folder with its own (non-subtree) record count — the sidebar tree
-   * derives subtree totals itself. Counts reflect the last rebuild. */
+  /** Every occupied folder with its own (non-subtree) live record count — the
+   * sidebar tree derives subtree totals itself. Folders emptied by moves or
+   * deletes drop out, exactly as a rebuild would drop them. */
   folders(): FolderCount[] {
     const { folderCounts, folderNames } = this.data;
     const list: FolderCount[] = [];
     for (let id = 0; id < folderNames.length; id += 1) {
-      list.push({ folder: folderNames[id]!, count: folderCounts[id]! });
+      const count = folderCounts[id]!;
+      if (count > 0) list.push({ folder: folderNames[id]!, count });
     }
     return list;
+  }
+
+  /** Live record count of one exact folder (no subtree). */
+  folderCount(folder: string) {
+    const id = this.folderIdByName.get(folder);
+    return id === undefined ? 0 : this.data.folderCounts[id]!;
   }
 
   /** How many live records point at this host. */

@@ -110,31 +110,32 @@ export function FolderTree({ folders, total, selection, onSelect, drag, onNewFol
   const allActive = selection.view === 'all';
   const allDropTarget = drag !== null && drag.overFolder === '';
   return (
-    <nav className="folder-tree" aria-label="Folders" role="tree" data-drag-scroll="true">
-      <div
-        className={`tree-row all-row${allActive ? ' active' : ''}${allDropTarget ? ' drop-target' : ''}`}
-        role="treeitem"
-        aria-selected={allActive}
-        tabIndex={0}
-        data-drop-folder=""
-        onClick={() => onSelect({ view: 'all', folder: '' })}
-        onKeyDown={(event) => {
-          if (event.key === 'Enter') onSelect({ view: 'all', folder: '' });
-        }}
-      >
-        <span className="tree-chevron hidden" />
-        <Library className="tree-icon" />
-        <span className="tree-name">All bookmarks</span>
-        <span className="tree-count">{formatCount(total)}</span>
-      </div>
-      <div className="tree-head">
-        <span>Folders</span>
-        <button className="icon-button small" title="New folder" aria-label="New folder" onClick={onNewFolder}>
+    <>
+      <div className="sidebar-hdr">
+        <span className="mono-label">Folder tree</span>
+        <button className="hdr-btn" title="New folder" aria-label="New folder" onClick={onNewFolder}>
           <FolderPlus />
         </button>
       </div>
-      {tree.map((node) => renderNode(node, 0))}
-    </nav>
+      <nav className="folder-tree" aria-label="Folders" role="tree" data-drag-scroll="true">
+        <div
+          className={`tree-row all-row${allActive ? ' active' : ''}${allDropTarget ? ' drop-target' : ''}`}
+          role="treeitem"
+          aria-selected={allActive}
+          tabIndex={0}
+          data-drop-folder=""
+          onClick={() => onSelect({ view: 'all', folder: '' })}
+          onKeyDown={(event) => {
+            if (event.key === 'Enter') onSelect({ view: 'all', folder: '' });
+          }}
+        >
+          <Library className="tree-icon" />
+          <span className="tree-name">All bookmarks</span>
+          <span className="tree-count">{formatCount(total)}</span>
+        </div>
+        {tree.map((node) => renderNode(node, 0))}
+      </nav>
+    </>
   );
 }
 

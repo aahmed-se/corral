@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef, type CSSProperties, type PointerEvent as ReactPointerEvent } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
-import { CheckSquare, ChevronRight, Folder, Square } from 'lucide-react';
+import { CheckSquare, ChevronRight, ExternalLink, Folder, FolderOpen, SearchX, Square, Trash2 } from 'lucide-react';
 import { openableBookmarkUrl } from '../lib/bookmark-url.ts';
 import { db, type BookmarkRecord } from '../lib/db.ts';
 import { countLabel, PAGE_SIZE, type Corral, type Density } from './use-corral.ts';
@@ -170,24 +170,33 @@ export function BookmarkList({ corral, onRowPointerDown, onRowContextMenu, onImp
       <div className="list-empty" ref={listRef}>
         {corral.stats.total === 0 && corral.selection.view === 'all' ? (
           <>
+            <FolderOpen className="empty-icon" aria-hidden="true" />
             <h2>Nothing corralled yet</h2>
             <p>Copy your Chrome bookmarks or import an export file — everything stays on this device.</p>
-            <button className="button primary large" onClick={onImport}>Import bookmarks</button>
+            <button className="tbtn primary" onClick={onImport}>Import bookmarks</button>
           </>
         ) : isSearching ? (
           <>
+            <SearchX className="empty-icon" aria-hidden="true" />
             <h2>No matches</h2>
-            <p>Corral matches anywhere in the title, URL, or folder — try fewer or shorter words.</p>
+            <p>Corral matches anywhere in the title, URL, site, or folder — try fewer or shorter words.</p>
           </>
         ) : (
           <>
+            <FolderOpen className="empty-icon" aria-hidden="true" />
             <h2>Empty folder</h2>
-            <p>Drag bookmarks here from another folder, or use right-click → Corral.</p>
+            <p>Drag bookmarks here from another folder, or right-click a bookmark and pick “Move to folder…”.</p>
           </>
         )}
       </div>
     );
   }
+
+  // Rows are CSS grids sharing the column template with the list header (see
+  // `--row-cols`): check · icon · title/url · site (cozy/compact) · folder ·
+  // date · actions. Every branch renders one cell per column so the header
+  // lines up whatever the row is.
+  const showHost = density !== 'roomy';
 
   return (
     <div className={`bookmark-list density-${density}`} ref={listRef} role="listbox" aria-multiselectable="true" aria-label="Folder contents" data-drag-scroll="true">
@@ -213,14 +222,16 @@ export function BookmarkList({ corral, onRowPointerDown, onRowContextMenu, onImp
                   }
                 }}
               >
-                <span className="folder-spacer" aria-hidden="true" />
+                <span aria-hidden="true" />
                 <span className="folder-mark" aria-hidden="true"><Folder /></span>
                 <span className="row-copy">
                   <span className="row-title">{folder.name}</span>
                   {density === 'roomy' && <span className="row-url">{folder.path}</span>}
                 </span>
+                {showHost && <span aria-hidden="true" />}
                 <span className="folder-count">{countLabel(folder.total, 'link')}</span>
                 <ChevronRight className="folder-chevron" aria-hidden="true" />
+                <span aria-hidden="true" />
               </div>
             );
           }
@@ -230,12 +241,27 @@ export function BookmarkList({ corral, onRowPointerDown, onRowContextMenu, onImp
           if (!record?.id) {
             return (
               <div key={`ghost-${bookmarkIndex}`} className="row placeholder" aria-hidden="true" style={{ transform: `translateY(${virtualRow.start}px)`, height: virtualRow.size }}>
-                <span className="ph ph-mark" /><span className="ph ph-line" />
+                <span /><span className="ph ph-mark" /><span className="ph ph-line" />
               </div>
             );
           }
           const id = record.id;
           const isSelected = selected.has(id);
+          // Sits beside the text it opens (the URL in roomy rows, the title
+          // otherwise) rather than in the far-right action column.
+          const openButton = (
+            <button
+              className="row-open"
+              title="Open in a new tab"
+              aria-label={`Open ${record.title}`}
+              onClick={(event) => {
+                event.stopPropagation();
+                openRecord(record);
+              }}
+            >
+              <ExternalLink />
+            </button>
+          );
           return (
             <div
               key={id}
@@ -268,23 +294,42 @@ export function BookmarkList({ corral, onRowPointerDown, onRowContextMenu, onImp
               </button>
               <SiteMark host={record.host} />
               <span className="row-copy">
-                <span className="row-title">{record.title}</span>
-                {density === 'roomy' && <span className="row-url">{record.url}</span>}
+                <span className="row-line">
+                  <span className="row-title">{record.title}</span>
+                  {density !== 'roomy' && openButton}
+                </span>
+                {density === 'roomy' && (
+                  <span className="row-line">
+                    <span className="row-url">{record.url}</span>
+                    {openButton}
+                  </span>
+                )}
               </span>
-              {density !== 'roomy' && <span className="row-host">{record.host}</span>}
-              {(density !== 'compact' || (corral.selection.view === 'folder' && record.folder !== corral.selection.folder)) && (
+              {showHost && <span className="row-host" title={record.host}>{record.host}</span>}
+              <button
+                className="row-folder"
+                title={`Open folder ${record.folder}`}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  corral.chooseView({ view: 'folder', folder: record.folder });
+                }}
+              >
+                {record.folder}
+              </button>
+              <time className="row-date">{formatDate(record.dateAdded)}</time>
+              <span className="row-actions">
                 <button
-                  className="row-folder"
-                  title={record.folder}
+                  className="action-btn remove"
+                  title="Remove bookmark"
+                  aria-label={`Remove ${record.title}`}
                   onClick={(event) => {
                     event.stopPropagation();
-                    corral.chooseView({ view: 'folder', folder: record.folder });
+                    void corral.deleteIds([id]);
                   }}
                 >
-                  {record.folder}
+                  <Trash2 />
                 </button>
-              )}
-              <time className="row-date">{formatDate(record.dateAdded)}</time>
+              </span>
             </div>
           );
         })}

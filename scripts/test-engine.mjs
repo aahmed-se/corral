@@ -178,4 +178,51 @@ assert(memberIndex.folderMemberSet('Work').size === 1, 'tombstone shrinks member
 const rankedHosts = memberIndex.hosts();
 assert(rankedHosts[0].host === 'a.com' && rankedHosts[0].count === 2, 'hosts ranked by count');
 
+// --- incremental patches: delta shards ---------------------------------------------
+// A move rewrites a record's folder text. The re-indexed copy lands in a delta
+// shard and supersedes the base entry, so search reflects the move at once.
+const deltaBuilder = new ShardBuilder();
+deltaBuilder.add({ id: 1, title: 'Recipe', url: 'https://food.example/soup', host: 'food.example', folder: 'Inbox' });
+deltaBuilder.add({ id: 2, title: 'Other', url: 'https://x.example/', host: 'x.example', folder: 'Inbox' });
+const deltaStore = ShardStore.fromShards(deltaBuilder.finish());
+assert(deltaStore.search('inbox', 10).ids.join(',') === '2,1', 'sanity: both in Inbox');
+const appended = deltaStore.reindex([{ id: 1, title: 'Recipe', url: 'https://food.example/soup', host: 'food.example', folder: 'Cooking' }]);
+assert(appended.length === 1 && deltaStore.shardCount === 2 && deltaStore.baseShards === 1, 'reindex appends one delta shard');
+assert(deltaStore.search('inbox', 10).ids.join(',') === '2', 'stale base entry no longer matches the old folder');
+assert(deltaStore.search('cooking', 10).ids.join(',') === '1', 'delta entry matches the new folder');
+assert(deltaStore.search('recipe', 10).ids.join(',') === '1' && deltaStore.search('recipe', 10).total === 1, 'a record re-indexed once still counts once');
+deltaStore.reindex([{ id: 1, title: 'Recipe', url: 'https://food.example/soup', host: 'food.example', folder: 'Archive' }]);
+assert(deltaStore.search('cooking', 10).ids.length === 0 && deltaStore.search('archive', 10).ids.join(',') === '1', 'latest delta wins over an earlier delta');
+assert(deltaStore.deltaRecordCount === 1, 'delta record count is per distinct id');
+deltaStore.tombstone([1]);
+assert(deltaStore.search('archive', 10).ids.length === 0, 'tombstone hides delta entries too');
+deltaStore.revive([1]);
+assert(deltaStore.search('archive', 10).ids.join(',') === '1', 'revive brings the record back');
+// Restoring from rows: everything past baseShardCount is a delta.
+const restoredDelta = ShardStore.fromShards([deltaStore.shardAt(0), deltaStore.shardAt(1), deltaStore.shardAt(2)], [], 1);
+assert(restoredDelta.search('inbox', 10).ids.join(',') === '2' && restoredDelta.search('archive', 10).ids.join(',') === '1', 'delta ownership is rebuilt from the base shard count');
+
+// --- incremental patches: view index --------------------------------------------------
+const pvb = new ViewIndexBuilder();
+pvb.add(1, 100, 'A', 0, 0); // Work
+pvb.add(2, 200, 'B', 0, 0); // Work
+pvb.add(3, 300, 'C', 1, 0); // Play
+const patched = new ViewIndex(pvb.finish(['Work', 'Play'], ['a.com']));
+assert(patched.moveRecords([{ id: 1, folder: 'Play' }, { id: 999, folder: 'Play' }]) === 1, 'move counts changed records and skips unknown ids');
+assert(patched.page(q({ view: 'folder', folder: 'Play' }), 0, 10).ids.join(',') === '3,1', 'moved record pages under its new folder');
+assert(patched.folderCount('Work') === 1 && patched.folderCount('Play') === 2, 'folder counts follow moves');
+assert(patched.moveRecords([{ id: 2, folder: 'Brand New' }]) === 1, 'move into a folder the index has never seen');
+assert(patched.folders().map((entry) => `${entry.folder}:${entry.count}`).join(',') === 'Play:2,Brand New:1', 'emptied folders drop out, new folders appear');
+assert(patched.folderMemberSet('Brand New').has(2), 'membership sets reflect moves');
+patched.tombstone([3]);
+assert(patched.folderCount('Play') === 1, 'tombstones lower folder counts');
+assert(patched.revive([3, 4242]).join(',') === '3' && patched.folderCount('Play') === 2, 'revive restores only ids the index holds');
+assert(patched.remapFolders((name) => (name === 'Brand New' ? 'Play' : null)) > 0, 'remap reports work when a folder is renamed');
+assert(patched.folderCount('Play') === 3 && patched.folderCount('Brand New') === 0, 'renaming onto an existing folder merges into it');
+patched.remapFolders((name) => (name === 'Play' || name.startsWith('Play / ') ? `Games${name.slice('Play'.length)}` : null));
+assert(patched.page(q({ view: 'folder', folder: 'Games' }), 0, 10).total === 3 && patched.folderCount('Play') === 0, 'subtree rename moves every record');
+assert(patched.remapFolders(() => null) === 0, 'a no-op remap touches nothing');
+assert(patched.has(1) && !patched.has(77), 'presence check');
+assert(serializeViewData(patched.exportData()).folderNames.split(' ').includes('Games'), 'patched names persist');
+
 console.log('engine tests: ALL PASS');

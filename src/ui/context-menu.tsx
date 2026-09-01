@@ -1,7 +1,8 @@
 import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
 
 export type MenuItem =
-  | { kind: 'item'; label: string; icon?: ReactNode; danger?: boolean; onSelect: () => void }
+  /** `hint` is a right-aligned micro-label, e.g. the scope an action applies to. */
+  | { kind: 'item'; label: string; hint?: string; icon?: ReactNode; danger?: boolean; onSelect: () => void }
   | { kind: 'separator' };
 
 export function ContextMenu({ x, y, items, onClose }: {
@@ -96,6 +97,7 @@ export function ContextMenu({ x, y, items, onClose }: {
           >
             {item.icon}
             <span>{item.label}</span>
+            {item.hint && <span className="menu-hint">{item.hint}</span>}
           </button>
         ),
       )}

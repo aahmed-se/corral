@@ -37,7 +37,7 @@ import {
   readFaviconBytes,
   type FaviconSource,
 } from './favicon-cache.ts';
-import { ShardBuilder, ShardStore, type ShardData } from './search-engine.ts';
+import { ShardBuilder, ShardStore, type SearchableRecord, type ShardData } from './search-engine.ts';
 import { deserializeViewData, serializeViewData, ViewIndex, ViewIndexBuilder } from './view-index.ts';
 import { yieldToQueue } from './task-queue.ts';
 
@@ -46,8 +46,9 @@ export type WorkerOp =
   | { kind: 'import-chrome'; inputs: RawBookmarkInput[] }
   /** Moves ids into a folder; returns prior folders so the UI can offer undo. */
   | { kind: 'move'; ids: number[]; destination: string }
-  /** Moves every bookmark on `host` into a folder. */
-  | { kind: 'corral-host'; host: string; destination: string }
+  /** Moves every bookmark on `host` into a folder; `folder` limits the
+   * roundup to that folder's subtree. */
+  | { kind: 'corral-host'; host: string; destination: string; folder?: string }
   | { kind: 'delete'; ids: number[] }
   /** Undo for a move/corral: puts each record back into its prior folder. */
   | { kind: 'restore-folders'; moves: Array<{ id: number; folder: string }> }
@@ -87,8 +88,10 @@ export type WorkerRequest =
   | { type: 'favicons-stop' };
 
 export type WorkerResponse =
-  | { type: 'phase'; phase: IndexPhase; done: number; total: number }
-  | { type: 'ready'; stats: LibraryStats; restored: boolean }
+  /** `quiet` marks a background compaction: the served content is already
+   * current, so the UI keeps its rows and only updates a status line. */
+  | { type: 'phase'; phase: IndexPhase; done: number; total: number; quiet: boolean }
+  | { type: 'ready'; stats: LibraryStats; restored: boolean; quiet: boolean }
   | { type: 'results'; requestId: number; ids: number[]; total: number; truncated: boolean; elapsedMs: number }
   | { type: 'page'; requestId: number; rows: Array<BookmarkRecord | undefined>; total?: number }
   | { type: 'page-error'; requestId: number; message: string }
@@ -115,10 +118,32 @@ export const UNDO_RECORD_LIMIT = 50_000;
 let serving: ShardStore | null = null;
 let servingViews: ViewIndex | null = null;
 let servingRevision = 0;
+/** The dirty token the persisted index currently claims. A patch may only be
+ * laid on top of the persisted index while this still matches — otherwise
+ * another tab saved first and its index must be adopted before ours. */
+let persistedDirtyRevision = 0;
 let rebuilding = false;
 let rebuildAgain = false;
 let forceRebuildAgain = false;
-let pendingTombstones: number[] = [];
+let quietRebuildAgain = true;
+
+/** One mutation's effect on the served index. Mutations never trigger a
+ * rescan: the worker applies the patch to the in-memory index at once, then
+ * saves it (a delta shard for changed search text plus the view arrays). */
+type Patch = {
+  /** The library's dirty token right after this op, read under the mutation lock. */
+  dirtyRevision: number;
+  tombstones?: number[];
+  revived?: number[];
+  moves?: Array<{ id: number; folder: string }>;
+  relocate?: { path: string; newPath: string };
+  /** Records whose searchable text changed (folder is part of it). */
+  records?: SearchableRecord[];
+};
+
+/** Patches that landed while a rebuild ran or while another tab's save had
+ * to be adopted first. Re-applied on top of whatever index comes next. */
+let pendingPatches: Patch[] = [];
 
 function post(message: WorkerResponse) {
   scope.postMessage(message);
@@ -156,9 +181,10 @@ async function restorePersistedIndex() {
       const viewData = deserializeViewData(await db.viewData.get(stats.revision));
       if (rows.length === stats.shards && viewData) {
         const shards: ShardData[] = rows.map((row) => ({ ids: row.ids, starts: row.starts, text: row.text }));
-        serving = ShardStore.fromShards(shards, tombstones);
+        serving = ShardStore.fromShards(shards, tombstones, stats.baseShards ?? stats.shards);
         servingViews = new ViewIndex(viewData, tombstones);
         servingRevision = stats.revision;
+        persistedDirtyRevision = stats.dirtyRevision;
         return { stats, tombstones: tombstones.length };
       }
     }
@@ -166,46 +192,145 @@ async function restorePersistedIndex() {
   return null;
 }
 
-async function rebuild(force = false) {
+/** Tombstones and delta shards are cheap to serve; only a real pile-up earns
+ * a full rescan, and that one runs quietly behind the current index. */
+function needsCompaction() {
+  if (!serving || !servingViews) return false;
+  const total = servingViews.size;
+  return serving.tombstoneCount > Math.max(5_000, total * 0.1)
+    || serving.shardCount - serving.baseShards > 32
+    || serving.deltaRecordCount > Math.max(20_000, total * 0.2);
+}
+
+async function rebuild(force = false, quiet = false) {
   if (rebuilding) {
     rebuildAgain = true;
     forceRebuildAgain ||= force;
+    quietRebuildAgain &&= quiet;
     return;
   }
   rebuilding = true;
   rebuildAgain = false;
   forceRebuildAgain = false;
+  quietRebuildAgain = true;
 
   try {
     await withBrowserLock(REBUILD_LOCK, 'exclusive', async () => {
       if (!force) {
         const restored = await restorePersistedIndex();
         if (restored) {
-          post({ type: 'ready', stats: restored.stats, restored: true });
-          // A tombstoned index is safe to serve but should be compacted once.
-          if (restored.tombstones > 0) {
+          post({ type: 'ready', stats: restored.stats, restored: true, quiet });
+          if (needsCompaction()) {
             rebuildAgain = true;
             forceRebuildAgain = true;
           }
           return;
         }
       }
-      await buildFreshIndex();
+      await buildFreshIndex(quiet);
     });
   } catch (error) {
     post({ type: 'fatal', message: error instanceof Error ? error.message : 'Indexing failed' });
   } finally {
     rebuilding = false;
+    // Mutations that landed mid-build are re-applied on top of the new index.
+    // Idempotent by construction: a move already caught by the scan changes
+    // nothing, and a re-indexed record simply supersedes its base entry.
+    const patches = pendingPatches;
+    pendingPatches = [];
+    for (const patch of patches) applyPatchInMemory(patch);
     const rerun = rebuildAgain;
     const rerunForce = forceRebuildAgain;
+    const rerunQuiet = quietRebuildAgain;
     rebuildAgain = false;
     forceRebuildAgain = false;
-    if (rerun) void rebuild(rerunForce);
+    quietRebuildAgain = true;
+    if (rerun) {
+      pendingPatches = patches;
+      void rebuild(rerunForce, rerunQuiet);
+    } else if (patches.length > 0) {
+      void persistPatches(patches);
+    }
   }
 }
 
-async function buildFreshIndex() {
-  pendingTombstones = [];
+// --- incremental patches -----------------------------------------------------
+
+function applyPatchInMemory(patch: Patch) {
+  const views = servingViews;
+  const store = serving;
+  if (!views || !store) return;
+  if (patch.tombstones) {
+    // Only ids the index holds: the tombstone count must keep matching the
+    // difference between the indexed total and the table for restore checks.
+    const present = patch.tombstones.filter((id) => views.has(id));
+    views.tombstone(present);
+    store.tombstone(present);
+  }
+  if (patch.revived) {
+    const revived = views.revive(patch.revived);
+    store.revive(revived);
+  }
+  if (patch.moves) views.moveRecords(patch.moves);
+  if (patch.relocate) {
+    const { path, newPath } = patch.relocate;
+    const prefix = path + FOLDER_SEPARATOR;
+    views.remapFolders((name) => (name === path || name.startsWith(prefix) ? newPath + name.slice(path.length) : null));
+  }
+  if (patch.records && patch.records.length > 0) store.reindex(patch.records);
+}
+
+/** Saves already-applied patches on top of the persisted index: new delta
+ * shard rows, the view arrays, tombstones, and a stats row whose dirty token
+ * now covers these ops. If another tab saved in between, its index is adopted
+ * first and the patches are laid on top of that instead. */
+async function persistPatches(patches: Patch[]) {
+  if (patches.length === 0) return;
+  if (rebuilding || !serving || !servingViews) {
+    if (rebuilding) pendingPatches.push(...patches);
+    return;
+  }
+  const store = serving;
+  const views = servingViews;
+  const revision = servingRevision;
+  const claimed = persistedDirtyRevision;
+  try {
+    const saved = await withBrowserLock(REBUILD_LOCK, 'exclusive', async () => {
+      if (rebuilding || serving !== store) return false;
+      const stats = await db.meta.get('stats');
+      if (!stats || stats.key !== 'stats' || stats.revision !== revision || stats.dirtyRevision !== claimed) return false;
+      for (let seq = stats.shards; seq < store.shardCount; seq += 1) {
+        const shard = store.shardAt(seq)!;
+        await db.searchShards.put({ seq, revision, ids: shard.ids, starts: shard.starts, text: shard.text });
+      }
+      await db.viewData.put({ revision, ...serializeViewData(views.exportData()) });
+      await persistTombstones();
+      const dirtyRevision = Math.max(stats.dirtyRevision, ...patches.map((patch) => patch.dirtyRevision));
+      await db.meta.put({
+        ...stats,
+        dirtyRevision,
+        shards: store.shardCount,
+        baseShards: stats.baseShards ?? stats.shards,
+        folders: views.folders().length,
+      });
+      persistedDirtyRevision = dirtyRevision;
+      return true;
+    });
+    if (!saved) {
+      pendingPatches.push(...patches);
+      await rebuild();
+      return;
+    }
+    coordination.postMessage({ type: 'library-changed' });
+    if (needsCompaction()) void rebuild(true, true);
+  } catch {
+    // The save failed (quota, closed database). The table is still the
+    // truth; a quiet rescan re-derives everything from it.
+    void rebuild(true, true);
+  }
+}
+
+async function buildFreshIndex(quiet: boolean) {
   const started = performance.now();
   const previousStats = await db.meta.get('stats');
   const previousRevision = previousStats && previousStats.key === 'stats' ? previousStats.revision : 0;
@@ -216,7 +341,7 @@ async function buildFreshIndex() {
     // the next launch (rebuildAgain covers the current session).
     const dirtyRevision = await getDirtyRevision();
     const total = await db.bookmarks.count();
-    post({ type: 'phase', phase: 'scanning', done: 0, total });
+    post({ type: 'phase', phase: 'scanning', done: 0, total, quiet });
 
     const shardBuilder = new ShardBuilder();
     const viewBuilder = new ViewIndexBuilder();
@@ -252,13 +377,13 @@ async function buildFreshIndex() {
       }
       scanned += records.length;
       lastId = records.at(-1)?.id ?? lastId;
-      post({ type: 'phase', phase: 'scanning', done: scanned, total });
+      post({ type: 'phase', phase: 'scanning', done: scanned, total, quiet });
       await yieldToQueue();
     }
     const shards = shardBuilder.finish();
 
     // The three permutation sorts — the only O(n log n) step.
-    post({ type: 'phase', phase: 'analyzing', done: scanned, total: scanned });
+    post({ type: 'phase', phase: 'analyzing', done: scanned, total: scanned, quiet });
     await yieldToQueue();
     const viewData = viewBuilder.finish(folderNames, hostNames);
     await yieldToQueue();
@@ -267,7 +392,7 @@ async function buildFreshIndex() {
     // Nothing written here scales with unique-host count.
     const saveTotal = shards.length + 1;
     let saved = 0;
-    const reportSave = () => post({ type: 'phase', phase: 'saving', done: saved, total: saveTotal });
+    const reportSave = () => post({ type: 'phase', phase: 'saving', done: saved, total: saveTotal, quiet });
     reportSave();
 
     await db.searchShards.clear();
@@ -294,25 +419,19 @@ async function buildFreshIndex() {
       hosts: hostNames.length,
       folders: folderNames.length,
       shards: shards.length,
+      baseShards: shards.length,
       indexedAt: Date.now(),
       buildMs: Math.round(performance.now() - started),
     };
-    serving = ShardStore.fromShards(shards, pendingTombstones);
-    servingViews = new ViewIndex(viewData, pendingTombstones);
+    serving = ShardStore.fromShards(shards);
+    servingViews = new ViewIndex(viewData);
     servingRevision = revision;
-    pendingTombstones = [];
+    persistedDirtyRevision = dirtyRevision;
     await persistTombstones();
     await db.meta.put(stats);
     // Extra-folder markers are retained even while occupied. If the last
     // bookmark later leaves, a user-created folder must remain in the tree.
-    post({ type: 'ready', stats, restored: false });
-}
-
-function applyTombstones(ids: number[]) {
-  serving?.tombstone(ids);
-  servingViews?.tombstone(ids);
-  if (rebuilding) pendingTombstones.push(...ids);
-  else if (serving) void persistTombstones();
+    post({ type: 'ready', stats, restored: false, quiet });
 }
 
 function runSearch(requestId: number, query: string, limit: number, folder?: string) {
@@ -354,9 +473,14 @@ type Progress = (label: string) => void;
 
 type OpOutcome = {
   payload?: unknown;
+  /** Only imports and unrecoverable undos rescan; everything else patches. */
   rebuild?: boolean;
-  tombstoneIds?: number[];
+  patch?: Omit<Patch, 'dirtyRevision'>;
 };
+
+function searchable(record: BookmarkRecord, folder = record.folder): SearchableRecord {
+  return { id: record.id!, title: record.title, url: record.url, host: record.host, folder };
+}
 
 async function insertInputs(inputs: RawBookmarkInput[], progress: Progress) {
   let written = 0;
@@ -406,7 +530,11 @@ async function moveWithUndo(ids: number[], destination: string, progress: Progre
   const priorFolders = records.map((record) => ({ id: record.id!, folder: record.folder }));
   await markLibraryDirty();
   const moved = await moveToFolder(ids, destination, (done) => progress(`Moved ${count(done)} of ${count(ids.length)}…`));
-  return { moved, priorFolders };
+  const patch: OpOutcome['patch'] = {
+    moves: records.map((record) => ({ id: record.id!, folder: destination })),
+    records: records.map((record) => searchable(record, destination)),
+  };
+  return { moved, priorFolders, patch };
 }
 
 /** Distinct folder paths that are `path` or live under it, per the folder
@@ -423,6 +551,7 @@ async function relocateFolder(path: string, newPath: string, progress: Progress)
   await markLibraryDirty();
   const affected = await subtreeFolderNames(path);
   const priorFolders: Array<{ id: number; folder: string }> = [];
+  const reindexed: SearchableRecord[] = [];
   let moved = 0;
   for (const name of affected) {
     const target = newPath + name.slice(path.length);
@@ -434,6 +563,7 @@ async function relocateFolder(path: string, newPath: string, progress: Progress)
         if (!record) continue;
         priorFolders.push({ id: record.id!, folder: record.folder });
         updated.push({ ...record, folder: target });
+        reindexed.push(searchable(record, target));
       }
       await db.bookmarks.bulkPut(updated);
       moved += updated.length;
@@ -448,7 +578,8 @@ async function relocateFolder(path: string, newPath: string, progress: Progress)
   // new path even when the old path was implied by children rather than listed.
   if (moved === 0 && !renamed.includes(newPath)) renamed.push(newPath);
   await setExtraFolders(renamed);
-  return { moved, priorFolders };
+  const patch: OpOutcome['patch'] = { relocate: { path, newPath }, records: reindexed };
+  return { moved, priorFolders, patch };
 }
 
 /** Full path → sanitized full path; empty when nothing survives. */
@@ -490,18 +621,22 @@ async function runOp(op: WorkerOp, progress: Progress): Promise<OpOutcome> {
     case 'move': {
       const destination = sanitizeName(op.destination);
       if (!destination) throw new Error('Choose a destination folder.');
-      const { moved, priorFolders } = await moveWithUndo(op.ids, destination, progress);
-      return { payload: { moved, destination, priorFolders }, rebuild: true };
+      const { moved, priorFolders, patch } = await moveWithUndo(op.ids, destination, progress);
+      return { payload: { moved, destination, priorFolders }, patch };
     }
 
     case 'corral-host': {
       const destination = sanitizeName(op.destination);
       if (!destination) throw new Error('Choose a destination folder.');
       if (!servingViews) throw new Error('Still indexing — try again in a moment.');
-      const ids = servingViews.idsForHost(op.host);
+      let ids = servingViews.idsForHost(op.host);
+      if (op.folder !== undefined) {
+        const members = servingViews.folderMemberSet(op.folder);
+        ids = ids.filter((id) => members.has(id));
+      }
       if (ids.length === 0) throw new Error(`No bookmarks found on ${op.host}.`);
-      const { moved, priorFolders } = await moveWithUndo(ids, destination, progress);
-      return { payload: { moved, destination, priorFolders }, rebuild: true };
+      const { moved, priorFolders, patch } = await moveWithUndo(ids, destination, progress);
+      return { payload: { moved, destination, priorFolders }, patch };
     }
 
     case 'delete': {
@@ -512,26 +647,32 @@ async function runOp(op: WorkerOp, progress: Progress): Promise<OpOutcome> {
         ? await getRecordsByIds(op.ids, (read) => progress(`Reading ${count(read)} of ${count(op.ids.length)}…`))
         : null;
       const deleted = await deleteByIds(op.ids, (done) => progress(`Removed ${count(done)} of ${count(op.ids.length)}…`));
-      return { payload: { deleted, undoRecords }, rebuild: true, tombstoneIds: op.ids };
+      return { payload: { deleted, undoRecords }, patch: { tombstones: op.ids } };
     }
 
     case 'restore-folders': {
       await markLibraryDirty();
       let restored = 0;
+      const moves: Array<{ id: number; folder: string }> = [];
+      const reindexed: SearchableRecord[] = [];
       for (let offset = 0; offset < op.moves.length; offset += 1_000) {
         const batch = op.moves.slice(offset, offset + 1_000);
         const rows = await db.bookmarks.bulkGet(batch.map((move) => move.id));
         const updated: BookmarkRecord[] = [];
         for (let index = 0; index < batch.length; index += 1) {
           const record = rows[index];
-          if (record) updated.push({ ...record, folder: batch[index]!.folder });
+          if (!record) continue;
+          const folder = batch[index]!.folder;
+          updated.push({ ...record, folder });
+          moves.push({ id: record.id!, folder });
+          reindexed.push(searchable(record, folder));
         }
         await db.bookmarks.bulkPut(updated);
         restored += updated.length;
         progress(`Moved ${count(restored)} of ${count(op.moves.length)} back…`);
         await yieldToQueue();
       }
-      return { payload: { restored }, rebuild: true };
+      return { payload: { restored }, patch: { moves, records: reindexed } };
     }
 
     case 'restore-records': {
@@ -546,7 +687,11 @@ async function runOp(op: WorkerOp, progress: Progress): Promise<OpOutcome> {
         progress(`Restored ${count(restored)} of ${count(op.records.length)}…`);
         await yieldToQueue();
       }
-      return { payload: { restored }, rebuild: true };
+      // The deleted rows are usually still in the index as tombstones and
+      // simply come back. Ids compacted away since need a rescan.
+      const ids = op.records.map((record) => record.id!);
+      if (!servingViews || !ids.every((id) => servingViews!.has(id))) return { payload: { restored }, rebuild: true };
+      return { payload: { restored }, patch: { revived: ids, moves: op.records.map((record) => ({ id: record.id!, folder: record.folder })) } };
     }
 
     case 'export':
@@ -572,8 +717,8 @@ async function runOp(op: WorkerOp, progress: Progress): Promise<OpOutcome> {
       if (newPath.startsWith(op.path + FOLDER_SEPARATOR)) {
         throw new Error('A folder can’t be renamed into its own subtree.');
       }
-      const { moved, priorFolders } = await relocateFolder(op.path, newPath, progress);
-      return { payload: { moved, path: op.path, newPath, priorFolders }, rebuild: true };
+      const { moved, priorFolders, patch } = await relocateFolder(op.path, newPath, progress);
+      return { payload: { moved, path: op.path, newPath, priorFolders }, patch };
     }
 
     case 'move-folder': {
@@ -584,8 +729,8 @@ async function runOp(op: WorkerOp, progress: Progress): Promise<OpOutcome> {
       }
       const newPath = newParent ? `${newParent}${FOLDER_SEPARATOR}${leafOf(op.path)}` : leafOf(op.path);
       if (newPath === op.path) return { payload: { moved: 0, path: op.path, newPath, priorFolders: [] } };
-      const { moved, priorFolders } = await relocateFolder(op.path, newPath, progress);
-      return { payload: { moved, path: op.path, newPath, priorFolders }, rebuild: true };
+      const { moved, priorFolders, patch } = await relocateFolder(op.path, newPath, progress);
+      return { payload: { moved, path: op.path, newPath, priorFolders }, patch };
     }
 
     case 'delete-folder': {
@@ -866,10 +1011,21 @@ function handleOp(requestId: number, op: WorkerOp) {
     const dirtyBefore = await getDirtyRevision();
     try {
       const outcome = await runOp(op, (label) => post({ type: 'op-progress', requestId, label }));
-      if (outcome.tombstoneIds && outcome.tombstoneIds.length > 0) applyTombstones(outcome.tombstoneIds);
+      // Read while this op still holds the mutation lock, so the token is
+      // this op's own and a saved patch never vouches for another tab's write.
+      const patch: Patch | null = outcome.patch ? { ...outcome.patch, dirtyRevision: await getDirtyRevision() } : null;
+      // The served index reflects the change before the UI hears "done", so
+      // its refresh already pages the new state — no rescan, no flicker.
+      if (patch) applyPatchInMemory(patch);
       post({ type: 'op-done', requestId, payload: outcome.payload });
-      if (MUTATING_OPS.has(op.kind)) coordination.postMessage({ type: 'library-changed' });
-      if (outcome.rebuild) void rebuild();
+      if (outcome.rebuild) {
+        coordination.postMessage({ type: 'library-changed' });
+        void rebuild();
+      } else if (patch) {
+        // Still under the mutation lock: no other tab can slip a write between
+        // this op and the save that claims its token.
+        await persistPatches([patch]);
+      }
     } catch (error) {
       post({ type: 'op-error', requestId, message: error instanceof Error ? error.message : 'The operation failed.' });
       // Validation failures, exports, and duplicate scans do not touch the

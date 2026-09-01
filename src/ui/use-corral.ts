@@ -27,6 +27,9 @@ export type IndexState = {
   total: number;
   restored: boolean;
   message: string;
+  /** A quiet compaction running behind a ready index — the rows on screen
+   * are already current, so this is a status line, not a loading state. */
+  background: { phase: IndexPhase; done: number; total: number } | null;
 };
 
 export type SearchState = {
@@ -119,7 +122,7 @@ function createPendingOp(
 export function useCorral() {
   const [stats, setStats] = useState<LibraryStats>(emptyStats);
   const [folders, setFolders] = useState<FolderCount[]>([]);
-  const [index, setIndex] = useState<IndexState>({ status: 'starting', phase: 'scanning', done: 0, total: 0, restored: false, message: '' });
+  const [index, setIndex] = useState<IndexState>({ status: 'starting', phase: 'scanning', done: 0, total: 0, restored: false, message: '', background: null });
   const [storageUsage, setStorageUsage] = useState(0);
 
   const [selection, setSelection] = useState<ViewSelection>({ view: 'all', folder: '' });
@@ -203,8 +206,9 @@ export function useCorral() {
     });
   }, []);
 
-  const refreshMetadata = useCallback(async (nextStats?: LibraryStats) => {
-    setStats(nextStats ?? (await getLibraryStats()));
+  /** Folder tree, icon count, and storage figure — everything the sidebar
+   * shows that is not a row. Cheap: the folder list is an instant worker read. */
+  const refreshSidebar = useCallback(async () => {
     const sidebar = await runOp<{ folders: FolderCount[]; stale: boolean }>({ kind: 'folders' }).catch(() => ({ folders: [], stale: true }));
     if (!sidebar.stale) setFolders(sidebar.folders);
     setFaviconCount(await countCachedFavicons());
@@ -214,17 +218,20 @@ export function useCorral() {
     }
   }, [runOp]);
 
+  const refreshMetadata = useCallback(async (nextStats?: LibraryStats) => {
+    // The stats row's `total` is the indexed count, tombstoned deletes
+    // included; the table is the live figure the UI should show.
+    const [base, total] = await Promise.all([nextStats ?? getLibraryStats(), db.bookmarks.count()]);
+    setStats({ ...base, total });
+    await refreshSidebar();
+  }, [refreshSidebar]);
+
   const invalidateList = useCallback(() => {
     pageGenerationRef.current += 1;
     loadingPagesRef.current.clear();
     viewIdsCacheRef.current = null;
     setPageCache(new Map());
     setListVersion((version) => version + 1);
-  }, []);
-
-  const dropInFlightPages = useCallback(() => {
-    pageGenerationRef.current += 1;
-    loadingPagesRef.current.clear();
   }, []);
 
   // --- worker lifecycle ---------------------------------------------------------
@@ -236,11 +243,17 @@ export function useCorral() {
     worker.onmessage = (event: MessageEvent<WorkerResponse>) => {
       const message = event.data;
       if (message.type === 'phase') {
-        setIndex((current) => ({ ...current, status: 'indexing', phase: message.phase, done: message.done, total: message.total }));
+        const progress = { phase: message.phase, done: message.done, total: message.total };
+        if (message.quiet) setIndex((current) => ({ ...current, background: progress }));
+        else setIndex((current) => ({ ...current, status: 'indexing', ...progress, background: null }));
       }
       if (message.type === 'ready') {
-        setIndex({ status: 'ready', phase: 'scanning', done: message.stats.total, total: message.stats.total, restored: message.restored, message: '' });
+        setIndex({ status: 'ready', phase: 'scanning', done: message.stats.total, total: message.stats.total, restored: message.restored, message: '', background: null });
         void refreshMetadata(message.stats);
+        // A quiet compaction changed no row anyone can see; the pages on screen
+        // stay put. Anything else (first index, import, another tab's edit)
+        // may have reordered or added rows, so the list re-pages.
+        if (!message.quiet) invalidateList();
       }
       if (message.type === 'results') {
         if (message.requestId !== searchRequestRef.current) return;
@@ -311,26 +324,28 @@ export function useCorral() {
       worker.terminate();
       workerRef.current = null;
     };
-  }, [refreshMetadata]);
+  }, [invalidateList, refreshMetadata]);
 
   useEffect(() => {
     window.localStorage.setItem('corral-density', density);
   }, [density]);
 
-  // --- view totals + invalidation ------------------------------------------------
+  // --- view totals -----------------------------------------------------------------
+  // Re-counted whenever the list is invalidated or the view changes. This
+  // effect never invalidates the list itself: the stats row used to drive
+  // invalidation, which re-paged every row (and flashed placeholders) each time
+  // the worker reported in after a mutation.
   useEffect(() => {
     let cancelled = false;
     void runOp<{ total: number }>({ kind: 'view-total', options: viewOptions() })
       .catch(() => ({ total: 0 }))
       .then(({ total }) => {
-        if (cancelled) return;
-        setViewTotal(total);
-        invalidateList();
+        if (!cancelled) setViewTotal(total);
       });
     return () => {
       cancelled = true;
     };
-  }, [invalidateList, runOp, stats, viewOptions]);
+  }, [listVersion, runOp, viewOptions]);
 
   // --- search -------------------------------------------------------------------
   const updateQuery = useCallback((value: string) => {
@@ -401,20 +416,22 @@ export function useCorral() {
   );
 
   // --- navigation -----------------------------------------------------------------
+  // Page cache keys carry no view identity, so a view or sort change must
+  // drop the cache (batched into the same render as the selection change).
   const chooseView = useCallback((view: ViewSelection) => {
-    dropInFlightPages();
+    invalidateList();
     setSelection(view);
     setSelected(new Set());
     selectionAnchorRef.current = null;
     // An active query stays and re-runs against the new scope.
     if (lastTrimmedQueryRef.current) setSearch((current) => ({ ...current, pending: true }));
-  }, [dropInFlightPages]);
+  }, [invalidateList]);
 
   const changeSort = useCallback((mode: SortMode) => {
-    dropInFlightPages();
+    invalidateList();
     selectionAnchorRef.current = null;
     setSort(mode);
-  }, [dropInFlightPages]);
+  }, [invalidateList]);
 
   // A range anchor is an index into one specific ordered result list. It must
   // never survive a query/scope identity change and point into another list.
@@ -528,13 +545,17 @@ export function useCorral() {
   }, []);
 
   // --- mutations --------------------------------------------------------------------
+  // Mutations patch the worker's index before they report done, so re-paging
+  // the list and re-reading the folder tree here shows the final state — there
+  // is no later "ready" to wait for.
   const refreshAfterMutation = useCallback(async () => {
     setSelected(new Set());
     selectionAnchorRef.current = null;
     invalidateList();
     const total = await db.bookmarks.count();
     setStats((current) => ({ ...current, total }));
-  }, [invalidateList]);
+    await refreshSidebar();
+  }, [invalidateList, refreshSidebar]);
 
   const offerUndo = useCallback((message: string, plan: UndoPlan | null) => {
     if (!plan || (plan.kind === 'folders' && plan.moves.length === 0) || (plan.kind === 'records' && plan.records.length === 0)) {
@@ -576,13 +597,15 @@ export function useCorral() {
     }
   }, [offerUndo, refreshAfterMutation, runOp]);
 
-  const corralHost = useCallback(async (host: string, destination: string) => {
+  /** Moves every bookmark on `host` into `destination` — library-wide, or
+   * only inside `folder`'s subtree when given. */
+  const corralHost = useCallback(async (host: string, destination: string, folder?: string) => {
     if (!host || !destination.trim()) return;
     setBusy(true);
     setBusyLabel(`Corralling ${host}…`);
     try {
       const { moved, destination: applied, priorFolders } = await runOp<{ moved: number; destination: string; priorFolders: Array<{ id: number; folder: string }> }>(
-        { kind: 'corral-host', host, destination },
+        { kind: 'corral-host', host, destination, folder },
         setBusyLabel,
       );
       await refreshAfterMutation();
@@ -666,6 +689,23 @@ export function useCorral() {
     return count;
   }, [runOp]);
 
+  /** Ids of every bookmark in the current list (folder scope or search
+   * results) that shares this record's base host. */
+  const hostMatchesInView = useCallback(async (id: number) => {
+    const { ids } = await runOp<{ hosts: string[]; ids: number[] }>({
+      kind: 'expand-host-selection',
+      ids: [id],
+      options: viewOptions(),
+      scopeIds: isSearching ? searchIdsRef.current : undefined,
+    });
+    return ids;
+  }, [isSearching, runOp, viewOptions]);
+
+  const selectIds = useCallback((ids: number[]) => {
+    setSelected(new Set(ids));
+    selectionAnchorRef.current = null;
+  }, []);
+
   // --- folder management -----------------------------------------------------------
   /** Keeps a selection inside a relocated subtree pointing at the new path. */
   const retargetSelection = useCallback((path: string, newPath: string) => {
@@ -681,14 +721,14 @@ export function useCorral() {
   const createFolder = useCallback(async (path: string) => {
     try {
       const { created } = await runOp<{ created: string }>({ kind: 'create-folder', path });
-      await refreshMetadata();
+      await refreshSidebar();
       setToast({ message: `Folder “${created}” created` });
       return created;
     } catch (error) {
       setToast({ message: error instanceof Error ? error.message : 'Could not create that folder' });
       return null;
     }
-  }, [refreshMetadata, runOp]);
+  }, [refreshSidebar, runOp]);
 
   type RelocatePayload = { moved: number; path: string; newPath: string; priorFolders: Array<{ id: number; folder: string }> };
 
@@ -699,14 +739,14 @@ export function useCorral() {
       const { moved, newPath, priorFolders } = await runOp<RelocatePayload>({ kind: 'rename-folder', path, newName }, setBusyLabel);
       retargetSelection(path, newPath);
       await refreshAfterMutation();
-      await refreshMetadata();
+      await refreshSidebar();
       offerUndo(`Renamed to ${newPath}`, moved > 0 ? { kind: 'folders', moves: priorFolders } : null);
     } catch (error) {
       setToast({ message: error instanceof Error ? error.message : 'Could not rename that folder' });
     } finally {
       setBusy(false);
     }
-  }, [offerUndo, refreshAfterMutation, refreshMetadata, retargetSelection, runOp]);
+  }, [offerUndo, refreshAfterMutation, refreshSidebar, retargetSelection, runOp]);
 
   const moveFolder = useCallback(async (path: string, newParent: string) => {
     setBusy(true);
@@ -715,14 +755,14 @@ export function useCorral() {
       const { moved, newPath, priorFolders } = await runOp<RelocatePayload>({ kind: 'move-folder', path, newParent }, setBusyLabel);
       retargetSelection(path, newPath);
       await refreshAfterMutation();
-      await refreshMetadata();
+      await refreshSidebar();
       offerUndo(`${path} is now ${newPath}`, moved > 0 ? { kind: 'folders', moves: priorFolders } : null);
     } catch (error) {
       setToast({ message: error instanceof Error ? error.message : 'Could not move that folder' });
     } finally {
       setBusy(false);
     }
-  }, [offerUndo, refreshAfterMutation, refreshMetadata, retargetSelection, runOp]);
+  }, [offerUndo, refreshAfterMutation, refreshSidebar, retargetSelection, runOp]);
 
   const deleteFolder = useCallback(async (path: string) => {
     try {
@@ -732,12 +772,12 @@ export function useCorral() {
           ? { view: 'all', folder: '' }
           : current,
       );
-      await refreshMetadata();
+      await refreshSidebar();
       setToast({ message: `Folder “${removed}” removed` });
     } catch (error) {
       setToast({ message: error instanceof Error ? error.message : 'Could not remove that folder' });
     }
-  }, [refreshMetadata, runOp]);
+  }, [refreshSidebar, runOp]);
 
   // --- duplicates -------------------------------------------------------------------
   /** Scans the library and returns the ids of every duplicate copy (the oldest
@@ -790,7 +830,7 @@ export function useCorral() {
     baseUrlHostCount: baseUrlSelection.hosts.length, baseUrlSelectionPending: baseUrlSelection.pending,
     canSelectAllWithBaseUrl: baseUrlSelection.ids.length > 0 && !baseUrlSelectionComplete,
     clearSelection,
-    moveIds, corralHost, deleteIds, importFromChrome, importFromFile, exportLibrary, hostCount,
+    moveIds, corralHost, deleteIds, importFromChrome, importFromFile, exportLibrary, hostCount, hostMatchesInView, selectIds,
     createFolder, renameFolder, moveFolder, deleteFolder, findDuplicates,
     favicons, faviconCount, iconVersion, buildFavicons, stopFavicons,
     canUseChrome, busy, busyLabel, toast, setToast,
