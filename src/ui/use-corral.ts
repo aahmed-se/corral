@@ -14,6 +14,7 @@ import {
   type ViewOptions,
 } from '../lib/db.ts';
 import { chromeBookmarksAvailable, downloadBlob, flattenChromeTree } from '../lib/import-export.ts';
+import type { BookmarkDraft } from '../lib/bookmark-edit.ts';
 import { buildTree, findTreeNode } from '../lib/folder-tree.ts';
 
 export const PAGE_SIZE = 240;
@@ -65,6 +66,8 @@ type BaseUrlSelection = {
 };
 
 type UndoPlan =
+  | { kind: 'relocate'; path: string; newPath: string }
+  | { kind: 'edit'; record: BookmarkRecord }
   | { kind: 'folders'; moves: Array<{ id: number; folder: string }> }
   | { kind: 'records'; records: BookmarkRecord[] };
 
@@ -144,6 +147,7 @@ export function useCorral() {
   const [baseUrlSelection, setBaseUrlSelection] = useState<BaseUrlSelection>({ ids: [], hosts: [], pending: false });
   const [busy, setBusy] = useState(false);
   const [busyLabel, setBusyLabel] = useState('');
+  const [deletionRequest, setDeletionRequest] = useState<number[] | null>(null);
   const [toast, setToast] = useState<ToastState | null>(null);
   const [favicons, setFavicons] = useState<FaviconState | null>(null);
   const [faviconCount, setFaviconCount] = useState(0);
@@ -351,6 +355,12 @@ export function useCorral() {
   const updateQuery = useCallback((value: string) => {
     const trimmed = value.trim();
     setQuery(value);
+    if (trimmed !== lastTrimmedQueryRef.current) {
+      searchRequestRef.current += 1;
+      invalidateList();
+      setSelected(new Set());
+      selectionAnchorRef.current = null;
+    }
     if (trimmed && trimmed !== lastTrimmedQueryRef.current) {
       setSearch((current) => ({ ...current, pending: true }));
     } else if (!trimmed && lastTrimmedQueryRef.current) {
@@ -359,7 +369,7 @@ export function useCorral() {
       setSearch(emptySearch);
     }
     lastTrimmedQueryRef.current = trimmed;
-  }, []);
+  }, [invalidateList]);
 
   useEffect(() => {
     if (!deferredQuery) return;
@@ -371,7 +381,7 @@ export function useCorral() {
       workerRef.current?.postMessage({ type: 'search', requestId, query: deferredQuery, limit: SEARCH_LIMIT, folder });
     }, 30);
     return () => window.clearTimeout(timer);
-  }, [deferredQuery, index.status, selection.folder, selection.view]);
+  }, [deferredQuery, index.status, selection.folder, selection.view, listVersion]);
 
   // --- toast --------------------------------------------------------------------
   useEffect(() => {
@@ -420,6 +430,7 @@ export function useCorral() {
   // drop the cache (batched into the same render as the selection change).
   const chooseView = useCallback((view: ViewSelection) => {
     invalidateList();
+    searchRequestRef.current += 1;
     setSelection(view);
     setSelected(new Set());
     selectionAnchorRef.current = null;
@@ -442,18 +453,23 @@ export function useCorral() {
   // --- selection -------------------------------------------------------------------
   /** Ordered ids of the current list (view or search), cached per invalidation. */
   const currentIds = useCallback(async () => {
-    if (isSearching) return searchIdsRef.current;
+    if (isSearching) {
+      if (search.pending || query.trim() !== deferredQuery) throw new Error('Wait for the current search to finish.');
+      return searchIdsRef.current;
+    }
     const cached = viewIdsCacheRef.current;
     const version = pageGenerationRef.current;
     if (cached && cached.version === version) return cached.ids;
     const { ids } = await runOp<{ ids: number[] }>({ kind: 'view-ids', options: viewOptions() });
-    viewIdsCacheRef.current = { version, ids };
+    if (version === pageGenerationRef.current) viewIdsCacheRef.current = { version, ids };
     return ids;
-  }, [isSearching, runOp, viewOptions]);
+  }, [isSearching, runOp, viewOptions, search.pending, query, deferredQuery]);
 
   const selectAllRows = useCallback(async () => {
     try {
+      const generation = pageGenerationRef.current;
       const ids = await currentIds();
+      if (generation !== pageGenerationRef.current) return;
       setSelected(new Set(ids));
       selectionAnchorRef.current = null;
     } catch (error) {
@@ -466,7 +482,10 @@ export function useCorral() {
     const toggle = event.metaKey || event.ctrlKey;
     if (event.shiftKey && selectionAnchorRef.current !== null) {
       const anchor = selectionAnchorRef.current;
-      const ids = await currentIds();
+      const generation = pageGenerationRef.current;
+      let ids: number[];
+      try { ids = await currentIds(); } catch { return; }
+      if (generation !== pageGenerationRef.current) return;
       const [from, to] = anchor <= rowIndex ? [anchor, rowIndex] : [rowIndex, anchor];
       const range = ids.slice(from, to + 1);
       setSelected((current) => {
@@ -567,11 +586,16 @@ export function useCorral() {
       undo: () => {
         setToast(null);
         setBusy(true);
-        const op: WorkerOp = plan.kind === 'folders' ? { kind: 'restore-folders', moves: plan.moves } : { kind: 'restore-records', records: plan.records };
+        const op: WorkerOp = plan.kind === 'folders' ? { kind: 'restore-folders', moves: plan.moves }
+          : plan.kind === 'relocate' ? { kind: 'undo-relocate', path: plan.path, newPath: plan.newPath }
+          : plan.kind === 'edit' ? { kind: 'save-bookmark', id: plan.record.id, draft: plan.record }
+          : { kind: 'restore-records', records: plan.records };
         runOp<{ restored: number }>(op, setBusyLabel)
           .then(async ({ restored }) => {
             await refreshAfterMutation();
-            setToast({ message: `${countLabel(restored)} restored` });
+            if (plan.kind === 'relocate') setSelection((current) => current.view === 'folder' && (current.folder === plan.path || current.folder.startsWith(plan.path + FOLDER_SEPARATOR))
+              ? { ...current, folder: plan.newPath + current.folder.slice(plan.path.length) } : current);
+            setToast({ message: plan.kind === 'relocate' ? 'Folder restored' : plan.kind === 'edit' ? 'Bookmark restored' : `${countLabel(restored)} restored` });
           })
           .catch((error) => setToast({ message: error instanceof Error ? error.message : 'Undo failed' }))
           .finally(() => setBusy(false));
@@ -617,8 +641,10 @@ export function useCorral() {
     }
   }, [offerUndo, refreshAfterMutation, runOp]);
 
-  const deleteIds = useCallback(async (ids: number[]) => {
+  const deleteIds = useCallback(async (ids: number[], confirmed = false) => {
     if (ids.length === 0) return;
+    if (ids.length > 50_000 && !confirmed) { setDeletionRequest(ids); return; }
+    setDeletionRequest(null);
     setBusy(true);
     setBusyLabel(`Removing ${countLabel(ids.length)}…`);
     try {
@@ -630,6 +656,20 @@ export function useCorral() {
     } finally {
       setBusy(false);
     }
+  }, [offerUndo, refreshAfterMutation, runOp]);
+
+  const saveBookmark = useCallback(async (draft: BookmarkDraft, id?: number) => {
+    setBusy(true);
+    setBusyLabel(id === undefined ? 'Adding bookmark…' : 'Saving bookmark…');
+    try {
+      const { previous } = await runOp<{ previous?: BookmarkRecord }>({ kind: 'save-bookmark', draft, id }, setBusyLabel);
+      await refreshAfterMutation();
+      offerUndo(id === undefined ? 'Bookmark added' : 'Bookmark updated', previous ? { kind: 'edit', record: previous } : null);
+      return true;
+    } catch (error) {
+      setToast({ message: error instanceof Error ? error.message : 'Could not save bookmark' });
+      return false;
+    } finally { setBusy(false); }
   }, [offerUndo, refreshAfterMutation, runOp]);
 
   const importFromChrome = useCallback(async () => {
@@ -730,17 +770,17 @@ export function useCorral() {
     }
   }, [refreshSidebar, runOp]);
 
-  type RelocatePayload = { moved: number; path: string; newPath: string; priorFolders: Array<{ id: number; folder: string }> };
+  type RelocatePayload = { moved: number; path: string; newPath: string };
 
   const renameFolder = useCallback(async (path: string, newName: string) => {
     setBusy(true);
     setBusyLabel(`Renaming ${path}…`);
     try {
-      const { moved, newPath, priorFolders } = await runOp<RelocatePayload>({ kind: 'rename-folder', path, newName }, setBusyLabel);
+      const { newPath } = await runOp<RelocatePayload>({ kind: 'rename-folder', path, newName }, setBusyLabel);
       retargetSelection(path, newPath);
       await refreshAfterMutation();
       await refreshSidebar();
-      offerUndo(`Renamed to ${newPath}`, moved > 0 ? { kind: 'folders', moves: priorFolders } : null);
+      offerUndo(`Renamed to ${newPath}`, newPath !== path ? { kind: 'relocate', path: newPath, newPath: path } : null);
     } catch (error) {
       setToast({ message: error instanceof Error ? error.message : 'Could not rename that folder' });
     } finally {
@@ -752,11 +792,11 @@ export function useCorral() {
     setBusy(true);
     setBusyLabel(`Moving ${path}…`);
     try {
-      const { moved, newPath, priorFolders } = await runOp<RelocatePayload>({ kind: 'move-folder', path, newParent }, setBusyLabel);
+      const { newPath } = await runOp<RelocatePayload>({ kind: 'move-folder', path, newParent }, setBusyLabel);
       retargetSelection(path, newPath);
       await refreshAfterMutation();
       await refreshSidebar();
-      offerUndo(`${path} is now ${newPath}`, moved > 0 ? { kind: 'folders', moves: priorFolders } : null);
+      offerUndo(`${path} is now ${newPath}`, newPath !== path ? { kind: 'relocate', path: newPath, newPath: path } : null);
     } catch (error) {
       setToast({ message: error instanceof Error ? error.message : 'Could not move that folder' });
     } finally {
@@ -830,7 +870,7 @@ export function useCorral() {
     baseUrlHostCount: baseUrlSelection.hosts.length, baseUrlSelectionPending: baseUrlSelection.pending,
     canSelectAllWithBaseUrl: baseUrlSelection.ids.length > 0 && !baseUrlSelectionComplete,
     clearSelection,
-    moveIds, corralHost, deleteIds, importFromChrome, importFromFile, exportLibrary, hostCount, hostMatchesInView, selectIds,
+    saveBookmark, deletionRequest, setDeletionRequest, moveIds, corralHost, deleteIds, importFromChrome, importFromFile, exportLibrary, hostCount, hostMatchesInView, selectIds,
     createFolder, renameFolder, moveFolder, deleteFolder, findDuplicates,
     favicons, faviconCount, iconVersion, buildFavicons, stopFavicons,
     canUseChrome, busy, busyLabel, toast, setToast,

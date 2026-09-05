@@ -13,6 +13,8 @@ export function ContextMenu({ x, y, items, onClose }: {
 }) {
   const menuRef = useRef<HTMLDivElement>(null);
   const priorFocusRef = useRef<HTMLElement | null>(document.activeElement instanceof HTMLElement ? document.activeElement : null);
+  const closeRef = useRef(onClose);
+  closeRef.current = onClose;
   const [position, setPosition] = useState({ left: x, top: y });
 
   // Clamp inside the viewport once rendered.
@@ -21,10 +23,10 @@ export function ContextMenu({ x, y, items, onClose }: {
     if (!menu) return;
     const bounds = menu.getBoundingClientRect();
     setPosition({
-      left: Math.min(x, window.innerWidth - bounds.width - 8),
-      top: Math.min(y, window.innerHeight - bounds.height - 8),
+      left: Math.max(8, Math.min(x, window.innerWidth - bounds.width - 8)),
+      top: Math.max(8, Math.min(y, window.innerHeight - bounds.height - 8)),
     });
-  }, [x, y]);
+  }, [x, y, items]);
 
   useEffect(() => {
     menuRef.current?.querySelector<HTMLButtonElement>('[role="menuitem"]')?.focus();
@@ -34,11 +36,11 @@ export function ContextMenu({ x, y, items, onClose }: {
     // click event ever fires.
     const closeIfOutside = (event: Event) => {
       if (menuRef.current && event.composedPath().includes(menuRef.current)) return;
-      onClose();
+      closeRef.current();
     };
-    const close = () => onClose();
+    const close = () => closeRef.current();
     const onKey = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') onClose();
+      if (event.key === 'Escape' || event.key === 'Tab') closeRef.current();
     };
     // Any click outside, scroll, or window blur closes the menu.
     window.addEventListener('pointerdown', closeIfOutside, true);
@@ -52,7 +54,7 @@ export function ContextMenu({ x, y, items, onClose }: {
       window.removeEventListener('wheel', closeIfOutside);
       priorFocusRef.current?.focus();
     };
-  }, [onClose]);
+  }, []);
 
   const moveFocus = (direction: 1 | -1) => {
     const buttons = Array.from(menuRef.current?.querySelectorAll<HTMLButtonElement>('[role="menuitem"]') ?? []);
@@ -91,7 +93,7 @@ export function ContextMenu({ x, y, items, onClose }: {
             className={`menu-item${item.danger ? ' danger' : ''}`}
             role="menuitem"
             onClick={() => {
-              onClose();
+              closeRef.current();
               item.onSelect();
             }}
           >

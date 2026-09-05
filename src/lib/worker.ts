@@ -27,7 +27,7 @@ import {
   type ShardRow,
   type ViewOptions,
 } from './db.ts';
-import { parseBookmarkJson, parseNetscapeHtml, toNetscapeHtmlParts, type RawBookmarkInput } from './import-export.ts';
+import { parseBookmarkArchive, parseNetscapeHtml, toNetscapeHtmlParts, folderExportSteps, NETSCAPE_HEADER, NETSCAPE_CLOSE, htmlFolderOpen, htmlBookmark, type RawBookmarkInput } from './import-export.ts';
 import { countImportKeys, importKey, selectUnmatchedInputs } from './import-merge.ts';
 import {
   chromeFaviconPageUrlCandidates,
@@ -40,8 +40,11 @@ import {
 import { ShardBuilder, ShardStore, type SearchableRecord, type ShardData } from './search-engine.ts';
 import { deserializeViewData, serializeViewData, ViewIndex, ViewIndexBuilder } from './view-index.ts';
 import { yieldToQueue } from './task-queue.ts';
+import { saveBookmark, type BookmarkDraft } from './bookmark-edit.ts';
 
 export type WorkerOp =
+  | { kind: 'save-bookmark'; draft: BookmarkDraft; id?: number }
+  | { kind: 'undo-relocate'; path: string; newPath: string }
   | { kind: 'import-file'; name: string; text: string }
   | { kind: 'import-chrome'; inputs: RawBookmarkInput[] }
   /** Moves ids into a folder; returns prior folders so the UI can offer undo. */
@@ -546,11 +549,13 @@ async function subtreeFolderNames(path: string) {
 }
 
 /** Rewrites the `path` prefix to `newPath` on every record in the subtree and
- * on the extras list, returning prior folders for the undo toast. */
+ * on the extras list. Undo reverses this relocation, including empty folders. */
 async function relocateFolder(path: string, newPath: string, progress: Progress) {
+  const names = [...await db.bookmarks.orderBy('folder').uniqueKeys(), ...await getExtraFolders()] as string[];
+  if (!names.some((name) => name === path || name.startsWith(path + FOLDER_SEPARATOR))) throw new Error('This folder no longer exists.');
+  if (names.some((name) => name === newPath || name.startsWith(newPath + FOLDER_SEPARATOR))) throw new Error(`“${newPath}” already exists. Choose a different name.`);
   await markLibraryDirty();
   const affected = await subtreeFolderNames(path);
-  const priorFolders: Array<{ id: number; folder: string }> = [];
   const reindexed: SearchableRecord[] = [];
   let moved = 0;
   for (const name of affected) {
@@ -561,7 +566,6 @@ async function relocateFolder(path: string, newPath: string, progress: Progress)
       const updated: BookmarkRecord[] = [];
       for (const record of rows) {
         if (!record) continue;
-        priorFolders.push({ id: record.id!, folder: record.folder });
         updated.push({ ...record, folder: target });
         reindexed.push(searchable(record, target));
       }
@@ -579,7 +583,7 @@ async function relocateFolder(path: string, newPath: string, progress: Progress)
   if (moved === 0 && !renamed.includes(newPath)) renamed.push(newPath);
   await setExtraFolders(renamed);
   const patch: OpOutcome['patch'] = { relocate: { path, newPath }, records: reindexed };
-  return { moved, priorFolders, patch };
+  return { moved, patch };
 }
 
 /** Full path → sanitized full path; empty when nothing survives. */
@@ -599,10 +603,22 @@ function leafOf(path: string) {
 
 async function runOp(op: WorkerOp, progress: Progress): Promise<OpOutcome> {
   switch (op.kind) {
+    case 'save-bookmark': {
+      const payload = await saveBookmark(op.draft, op.id);
+      return { payload, rebuild: true };
+    }
+    case 'undo-relocate': {
+      const { moved, patch } = await relocateFolder(op.path, op.newPath, progress);
+      return { payload: { restored: moved }, patch };
+    }
     case 'import-file': {
       progress(`Parsing ${op.name}…`);
-      const inputs = op.name.toLowerCase().endsWith('.json') ? parseBookmarkJson(op.text) : parseNetscapeHtml(op.text);
-      if (inputs.length === 0) throw new Error('No bookmarks were found in that file.');
+      const folderPaths: string[] = [];
+      const archive = op.name.toLowerCase().endsWith('.json') ? parseBookmarkArchive(op.text) : { records: parseNetscapeHtml(op.text, folderPaths), folders: folderPaths };
+      const inputs = archive.records;
+      if (inputs.length === 0 && archive.folders.length === 0) throw new Error('No bookmarks or folders were found in that file.');
+      const extras = await getExtraFolders();
+      await setExtraFolders([...extras, ...archive.folders.map(sanitizePath).filter(Boolean)]);
       const { additions, skipped } = await newImportInputs(inputs, progress);
       if (additions.length === 0) return { payload: { imported: 0, skipped } };
       await markLibraryDirty();
@@ -717,8 +733,8 @@ async function runOp(op: WorkerOp, progress: Progress): Promise<OpOutcome> {
       if (newPath.startsWith(op.path + FOLDER_SEPARATOR)) {
         throw new Error('A folder can’t be renamed into its own subtree.');
       }
-      const { moved, priorFolders, patch } = await relocateFolder(op.path, newPath, progress);
-      return { payload: { moved, path: op.path, newPath, priorFolders }, patch };
+      const { moved, patch } = await relocateFolder(op.path, newPath, progress);
+      return { payload: { moved, path: op.path, newPath }, patch };
     }
 
     case 'move-folder': {
@@ -729,8 +745,8 @@ async function runOp(op: WorkerOp, progress: Progress): Promise<OpOutcome> {
       }
       const newPath = newParent ? `${newParent}${FOLDER_SEPARATOR}${leafOf(op.path)}` : leafOf(op.path);
       if (newPath === op.path) return { payload: { moved: 0, path: op.path, newPath, priorFolders: [] } };
-      const { moved, priorFolders, patch } = await relocateFolder(op.path, newPath, progress);
-      return { payload: { moved, path: op.path, newPath, priorFolders }, patch };
+      const { moved, patch } = await relocateFolder(op.path, newPath, progress);
+      return { payload: { moved, path: op.path, newPath }, patch };
     }
 
     case 'delete-folder': {
@@ -834,36 +850,36 @@ async function exportRecords(format: 'json' | 'html', ids: number[] | undefined,
       progress(`Exported ${count(exported)}…`);
       await yieldToQueue();
     }
-    return { payload: { blob: new Blob(jsonParts(parts), { type: 'application/json' }), exported, filename } };
+    return { payload: { blob: new Blob(jsonParts(parts, await getExtraFolders()), { type: 'application/json' }), exported, filename } };
   }
 
-  // HTML: stream folder by folder, each folder fetched in bounded chunks.
-  const folders = (await db.bookmarks.orderBy('folder').uniqueKeys()) as string[];
-  const parts: string[] = [
-    '<!DOCTYPE NETSCAPE-Bookmark-file-1>\n<META HTTP-EQUIV="Content-Type" CONTENT="text/html; charset=UTF-8">\n<TITLE>Corral Bookmarks</TITLE>\n<H1>Corral Bookmarks</H1>\n<DL><p>\n',
-  ];
-  for (const folder of folders) {
-    const keys = (await db.bookmarks.where('folder').equals(folder).primaryKeys()) as number[];
+  // HTML: stream each real folder once, fetching its records in bounded chunks.
+  const folders = [...await db.bookmarks.orderBy('folder').uniqueKeys(), ...await getExtraFolders()] as string[];
+  const parts: string[] = [NETSCAPE_HEADER];
+  for (const step of folderExportSteps(folders)) {
+    if (step.kind === 'close') { parts.push(NETSCAPE_CLOSE); continue; }
+    parts.push(htmlFolderOpen(step.name));
+    const keys = (await db.bookmarks.where('folder').equals(step.path).primaryKeys()) as number[];
     for (let offset = 0; offset < keys.length; offset += INSERT_CHUNK) {
       const chunk = await db.bookmarks.bulkGet(keys.slice(offset, offset + INSERT_CHUNK));
       const records = chunk.filter((record): record is BookmarkRecord => Boolean(record));
-      parts.push(...toNetscapeHtmlParts(records).slice(1, -1));
+      parts.push(records.map(htmlBookmark).join(''));
       exported += records.length;
       progress(`Exported ${count(exported)}…`);
       await yieldToQueue();
     }
   }
-  parts.push('</DL><p>\n');
+  parts.push(NETSCAPE_CLOSE);
   return { payload: { blob: new Blob(parts, { type: 'text/html' }), exported, filename } };
 }
 
-function jsonParts(recordParts: string[]) {
-  const parts: string[] = [`{"format":"corral-bookmarks","version":1,"exportedAt":"${new Date().toISOString()}","records":[\n`];
+function jsonParts(recordParts: string[], folders: string[] = []) {
+  const parts: string[] = [`{"format":"corral-bookmarks","version":2,"exportedAt":"${new Date().toISOString()}","records":[\n`];
   for (let index = 0; index < recordParts.length; index += 1) {
     parts.push(recordParts[index]!);
     if (index < recordParts.length - 1) parts.push(',\n');
   }
-  parts.push('\n]}\n');
+  parts.push(`\n],"folders":${JSON.stringify(folders)}}\n`);
   return parts;
 }
 
@@ -993,7 +1009,7 @@ async function buildFavicons(source: FaviconSource) {
 const INSTANT_READ_OPS = new Set<WorkerOp['kind']>(['folders', 'host-count', 'expand-host-selection', 'view-ids', 'view-total']);
 const MUTATING_OPS = new Set<WorkerOp['kind']>([
   'import-file', 'import-chrome', 'move', 'corral-host', 'delete', 'restore-folders', 'restore-records',
-  'create-folder', 'rename-folder', 'move-folder', 'delete-folder',
+  'create-folder', 'rename-folder', 'move-folder', 'delete-folder', 'save-bookmark', 'undo-relocate',
 ]);
 const coordination = new BroadcastChannel('corral-library-coordination');
 coordination.onmessage = () => {
@@ -1025,6 +1041,8 @@ function handleOp(requestId: number, op: WorkerOp) {
         // Still under the mutation lock: no other tab can slip a write between
         // this op and the save that claims its token.
         await persistPatches([patch]);
+      } else if (MUTATING_OPS.has(op.kind)) {
+        coordination.postMessage({ type: 'library-changed' });
       }
     } catch (error) {
       post({ type: 'op-error', requestId, message: error instanceof Error ? error.message : 'The operation failed.' });

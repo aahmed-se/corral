@@ -3,13 +3,15 @@
 // fields at 4x supersampling, then encoded as PNG through node:zlib.
 // The glyph matches the brand: a white lasso on the indigo gradient.
 // Usage: node scripts/make-icons.mjs
+// Bookmark OS: node scripts/make-icons.mjs --bookmark-os
 
 import { deflateSync } from 'node:zlib';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const OUT_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', 'public', 'icons');
+const BOOKMARK_OS = process.argv.includes('--bookmark-os');
+const OUT_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', BOOKMARK_OS ? 'bookmark-os' : 'public', 'icons');
 const SIZES = [16, 32, 48, 128];
 const SUPERSAMPLE = 4;
 
@@ -169,9 +171,44 @@ function render(size) {
   return encodePng(size, rgba);
 }
 
+// A solid ribbon keeps its notch legible at 16px. Render directly at each
+// target size with supersampling, rather than shrinking a large bitmap.
+function renderBookmarkOS(size) {
+  const rgba = Buffer.alloc(size * size * 4);
+  const samples = SUPERSAMPLE * SUPERSAMPLE;
+  for (let py = 0; py < size; py++) {
+    for (let px = 0; px < size; px++) {
+      const sum = [0, 0, 0];
+      let covered = 0;
+      for (let sy = 0; sy < SUPERSAMPLE; sy++) {
+        for (let sx = 0; sx < SUPERSAMPLE; sx++) {
+          const x = (px + (sx + 0.5) / SUPERSAMPLE) / size;
+          const y = (py + (sy + 0.5) / SUPERSAMPLE) / size;
+          const edge = roundedRectDistance(x, y, 0.5, 0.22);
+          if (edge > 0) continue;
+          let color = [23, 36, 59].map((top, channel) => top + ([8, 13, 24][channel] - top) * y);
+          if (edge > -0.025) color = [51, 69, 101];
+          // SVG-equivalent path: M8 6 H24 V26 L16 21 L8 26 Z.
+          const bottom = 21 / 32 + Math.abs(x - 0.5) * 5 / 8;
+          if (x >= 0.25 && x <= 0.75 && y >= 6 / 32 && y <= bottom) {
+            const t = Math.max(0, Math.min(1, (y - 6 / 32) / (20 / 32)));
+            color = [241, 205, 120].map((top, channel) => top + ([212, 168, 67][channel] - top) * t);
+          }
+          for (let channel = 0; channel < 3; channel++) sum[channel] += color[channel];
+          covered++;
+        }
+      }
+      const offset = (py * size + px) * 4;
+      for (let channel = 0; channel < 3; channel++) rgba[offset + channel] = covered ? Math.round(sum[channel] / covered) : 0;
+      rgba[offset + 3] = Math.round(255 * covered / samples);
+    }
+  }
+  return encodePng(size, rgba);
+}
+
 mkdirSync(OUT_DIR, { recursive: true });
 for (const size of SIZES) {
   const file = join(OUT_DIR, `icon-${size}.png`);
-  writeFileSync(file, render(size));
+  writeFileSync(file, BOOKMARK_OS ? renderBookmarkOS(size) : render(size));
   console.log('wrote', file);
 }

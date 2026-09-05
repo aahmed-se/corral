@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>BookmarkOS</title>
+  <link rel="icon" type="image/png" sizes="32x32" href="icons/icon-32.png">
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+<div id="app">
+
+  <!-- Loading overlay -->
+  <div id="loading">
+    <div class="loading-logo">BOOKMARK<em>OS</em></div>
+    <div class="loading-bar-wrap"><div class="loading-bar"></div></div>
+    <div class="loading-msg" id="loading-msg">LOADING BOOKMARKS...</div>
+  </div>
+
+  <!-- Topbar -->
+  <header id="topbar">
+    <button class="tbtn" id="btn-sidebar" aria-label="Toggle folders" aria-expanded="false" aria-controls="sidebar">☰</button>
+    <div class="logo">BOOKMARK<em>OS</em></div>
+    <div class="search-wrap">
+      <input aria-label="Search bookmarks" id="search-input" type="text" placeholder="Search titles, URLs… (Ctrl+F)">
+    </div>
+    <div class="topbar-stats">
+      <div class="stat-chip"><strong id="stat-total">0</strong> BOOKMARKS</div>
+      <div class="stat-chip"><strong id="stat-folders">0</strong> FOLDERS</div>
+      <div class="stat-chip"><strong id="stat-dups">0</strong> DUPLICATES</div>
+    </div>
+    <div class="topbar-btns">
+      <button class="tbtn" id="btn-add">+ ADD</button>
+      <button class="tbtn" id="btn-export">↓ BACKUP</button>
+      <button class="tbtn" id="btn-undo" disabled>↶ UNDO</button>
+      <button class="tbtn" id="btn-show-dups">🔍 FIND DUPS</button>
+      <button class="tbtn" id="btn-auto-org">⚡ AUTO-ORGANIZE</button>
+      <button class="tbtn" id="btn-refresh">↻ REFRESH</button>
+    </div>
+  </header>
+
+  <!-- Main -->
+  <div id="main">
+
+    <!-- Sidebar -->
+    <aside id="sidebar">
+      <div class="sidebar-hdr">
+        <span>FOLDER TREE</span>
+        <button id="btn-new-folder" title="New folder">+</button>
+      </div>
+      <p class="sidebar-note">Changes update Chrome bookmarks.</p>
+      <div id="folder-tree">
+        <button class="all-bm-row active" id="all-row" type="button">
+          <span>📚</span>
+          <span class="all-bm-label">All Bookmarks</span>
+          <span class="all-bm-count" id="all-count">0</span>
+        </button>
+      </div>
+    </aside>
+
+    <!-- Content -->
+    <div id="content">
+      <!-- Toolbar -->
+      <div id="toolbar">
+        <label for="sort-select">SORT</label>
+        <select id="sort-select">
+          <option value="dateAdded-desc">Newest first</option>
+          <option value="dateAdded-asc">Oldest first</option>
+          <option value="title-asc">Title A→Z</option>
+          <option value="title-desc">Title Z→A</option>
+          <option value="url-asc">URL A→Z</option>
+          <option value="domain-asc">Domain A→Z</option>
+        </select>
+        <div class="toolbar-sep"></div>
+        <label for="domain-select">DOMAIN</label>
+        <select id="domain-select">
+          <option value="">All domains</option>
+        </select>
+        <div class="toolbar-sep"></div>
+        <button class="tbtn" id="btn-select-all" style="padding:5px 10px;font-size:9px;">SELECT ALL</button>
+        <button class="tbtn" id="btn-clear-filters" style="padding:5px 10px;font-size:9px;display:none;">✕ CLEAR FILTERS</button>
+        <span id="results-count" style="margin-left:auto;font-family:var(--mono);font-size:10px;color:var(--text2);">0 items</span>
+      </div>
+
+      <!-- Bulk action bar -->
+      <div id="bulk-bar">
+        <span id="sel-count">0 SELECTED</span>
+        <div class="bulk-spacer"></div>
+        <button class="tbtn" id="btn-move-sel">📁 MOVE TO…</button>
+        <button class="tbtn danger" id="btn-del-sel">🗑 DELETE</button>
+        <button class="tbtn" id="btn-deselect">✕ DESELECT</button>
+      </div>
+
+      <!-- Column headers -->
+      <div class="list-header">
+        <div class="col-hdr chk"></div>
+        <div class="col-hdr fav"></div>
+        <div class="col-hdr title">TITLE / URL</div>
+        <div class="col-hdr date">DATE ADDED</div>
+        <div class="col-hdr acts"></div>
+      </div>
+
+      <!-- Virtual list -->
+      <div id="list-viewport">
+        <div id="list-sizer"></div>
+      </div>
+    </div>
+
+  </div><!-- /main -->
+
+  <!-- Duplicate panel (slide-in from right) -->
+  <div id="dup-panel">
+    <div class="dup-panel-hdr">
+      <span>⚠ DUPLICATE BOOKMARKS</span>
+      <button class="btn sm" id="btn-close-dups">✕</button>
+    </div>
+    <div id="dup-list" style="flex:1;overflow-y:auto;padding:8px 0;"></div>
+    <div style="padding:12px 14px;border-top:1px solid var(--border);">
+      <button class="btn primary" id="btn-del-all-dups" style="width:100%;">DELETE ALL DUPLICATES</button>
+    </div>
+  </div>
+
+</div><!-- /app -->
+
+<!-- Modal -->
+<div id="modal-overlay">
+  <div id="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+    <button class="modal-close" id="modal-close" aria-label="Close dialog">✕</button>
+    <div class="modal-hdr" id="modal-title">MODAL</div>
+    <div class="modal-body" id="modal-body"></div>
+    <div class="modal-footer" id="modal-footer"></div>
+  </div>
+</div>
+
+<!-- Toast -->
+<div id="toast" role="status" aria-live="polite"></div>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>

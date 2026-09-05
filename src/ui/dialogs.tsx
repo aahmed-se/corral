@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { Compass, Download, FileJson2, FileUp, Folder, FolderPlus, X } from 'lucide-react';
-import { FOLDER_SEPARATOR, type FolderCount } from '../lib/db.ts';
+import { FOLDER_SEPARATOR, UNFILED, type BookmarkRecord, type FolderCount } from '../lib/db.ts';
+import { openableBookmarkUrl } from '../lib/bookmark-url.ts';
+import type { BookmarkDraft } from '../lib/bookmark-edit.ts';
 import { countLabel } from './use-corral.ts';
 
 function Dialog({ title, subtitle, onClose, children }: {
@@ -11,9 +13,11 @@ function Dialog({ title, subtitle, onClose, children }: {
 }) {
   const backdropRef = useRef<HTMLDivElement>(null);
   const priorFocusRef = useRef<HTMLElement | null>(document.activeElement instanceof HTMLElement ? document.activeElement : null);
+  const closeRef = useRef(onClose);
+  closeRef.current = onClose;
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') onClose();
+      if (event.key === 'Escape') closeRef.current();
       if (event.key !== 'Tab' || !backdropRef.current) return;
       const focusable = Array.from(backdropRef.current.querySelectorAll<HTMLElement>('button:not(:disabled):not([hidden]), input:not(:disabled):not([hidden]), select:not(:disabled):not([hidden]), [tabindex]:not([tabindex="-1"]):not([hidden])'));
       if (focusable.length === 0) return;
@@ -30,7 +34,7 @@ function Dialog({ title, subtitle, onClose, children }: {
       window.removeEventListener('keydown', onKey);
       priorFocusRef.current?.focus();
     };
-  }, [onClose]);
+  }, []);
 
   return (
     <div
@@ -52,6 +56,44 @@ function Dialog({ title, subtitle, onClose, children }: {
       </div>
     </div>
   );
+}
+
+export function BookmarkDialog({ record, folder, folders, onSave, onClose }: {
+  record?: BookmarkRecord;
+  folder: string;
+  folders: FolderCount[];
+  onSave: (draft: BookmarkDraft, id?: number) => Promise<boolean>;
+  onClose: () => void;
+}) {
+  const [draft, setDraft] = useState<BookmarkDraft>({ title: record?.title ?? '', url: record?.url ?? '', folder: record?.folder ?? (folder || UNFILED) });
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
+  const urlRef = useRef<HTMLInputElement>(null);
+  useEffect(() => urlRef.current?.focus(), []);
+  const close = () => { if (!saving) onClose(); };
+  return <Dialog title={record ? 'Edit bookmark' : 'Add bookmark'} subtitle="Save a link in your local library." onClose={close}>
+    <form className="picker bookmark-form" onSubmit={async (event) => {
+      event.preventDefault();
+      if (saving) return;
+      if (!openableBookmarkUrl(draft.url)) { setError('Enter a complete, supported URL, such as https://example.com.'); urlRef.current?.focus(); return; }
+      setError('');
+      setSaving(true);
+      const saved = await onSave(draft, record?.id);
+      setSaving(false);
+      if (saved) onClose();
+      else setError('The bookmark could not be saved. Your changes are still here; please try again.');
+    }}>
+      <label>URL<input ref={urlRef} className="picker-input" value={draft.url} required spellCheck={false} placeholder="https://example.com" onChange={(event) => setDraft({ ...draft, url: event.target.value })} /></label>
+      <label>Title<input className="picker-input" value={draft.title} placeholder="Optional — defaults to the URL" onChange={(event) => setDraft({ ...draft, title: event.target.value })} /></label>
+      <label>Folder<input className="picker-input" list="bookmark-folders" value={draft.folder} onChange={(event) => setDraft({ ...draft, folder: event.target.value })} /></label>
+      <datalist id="bookmark-folders">{folders.map(({ folder: path }) => <option key={path} value={path} />)}</datalist>
+      {error && <p className="form-error" role="alert">{error}</p>}
+      <footer className="dialog-footer">
+        <button type="button" className="button ghost" disabled={saving} onClick={close}>Cancel</button>
+        <button className="button primary" type="submit" disabled={saving}>{saving ? 'Saving…' : 'Save bookmark'}</button>
+      </footer>
+    </form>
+  </Dialog>;
 }
 
 /** Destination picker used by Move, drag-to-new, and Corral: filter existing

@@ -6,7 +6,9 @@ import {
   CopyMinus,
   CornerLeftUp,
   Download,
+  Upload,
   ExternalLink,
+  Pencil,
   Folder,
   FolderInput,
   FolderPen,
@@ -28,7 +30,7 @@ import { db, FOLDER_SEPARATOR, UNFILED, type BookmarkRecord, type SortMode } fro
 import { openableBookmarkUrl } from './lib/bookmark-url.ts';
 import { BookmarkList } from './ui/bookmark-list.tsx';
 import { ContextMenu, type MenuItem } from './ui/context-menu.tsx';
-import { ConfirmDialog, ExportDialog, FolderPickerDialog, ImportDialog, NameDialog } from './ui/dialogs.tsx';
+import { BookmarkDialog, ConfirmDialog, ExportDialog, FolderPickerDialog, ImportDialog, NameDialog } from './ui/dialogs.tsx';
 import { FolderTree, springExpand, type TreeNode } from './ui/folder-tree.tsx';
 import { countLabel, useCorral, type Corral, type Density } from './ui/use-corral.ts';
 import { useDrag, type DragPayload } from './ui/use-drag.ts';
@@ -76,6 +78,9 @@ export function App() {
   const selectAllRows = corral.selectAllRows;
   const clearSelection = corral.clearSelection;
   const selectedCount = corral.selected.size;
+  const [bookmarkEditor, setBookmarkEditor] = useState<{ record?: BookmarkRecord } | null>(null);
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const menuRequestRef = useRef(0);
   const [menu, setMenu] = useState<MenuState | null>(null);
   const [menuFacts, setMenuFacts] = useState<MenuFacts>({ hostTotal: null, viewIds: null });
   const [folderMenu, setFolderMenu] = useState<FolderMenuState | null>(null);
@@ -96,7 +101,7 @@ export function App() {
         return;
       }
       const inField = event.target instanceof Element && event.target.closest('input, textarea, select, [contenteditable], [role="dialog"], [role="menu"]');
-      if (event.key === '/' && !inField && !overlayOpen && !event.metaKey && !event.ctrlKey && !event.altKey) {
+      if ((event.key === '/' || ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k')) && !inField && !overlayOpen && !event.altKey) {
         event.preventDefault();
         searchRef.current?.focus();
         return;
@@ -154,10 +159,11 @@ export function App() {
     if (!record.id) return;
     const id = record.id;
     const targetIds = corral.selected.has(id) ? Array.from(corral.selected) : [id];
+    const request = ++menuRequestRef.current;
     setMenu({ x: event.clientX, y: event.clientY, record, targetIds });
     setMenuFacts({ hostTotal: null, viewIds: null });
-    void corral.hostCount(record.host).then((hostTotal) => setMenuFacts((facts) => ({ ...facts, hostTotal }))).catch(() => undefined);
-    void corral.hostMatchesInView(id).then((viewIds) => setMenuFacts((facts) => ({ ...facts, viewIds }))).catch(() => undefined);
+    void corral.hostCount(record.host).then((hostTotal) => { if (menuRequestRef.current === request) setMenuFacts((facts) => ({ ...facts, hostTotal })); }).catch(() => undefined);
+    void corral.hostMatchesInView(id).then((viewIds) => { if (menuRequestRef.current === request) setMenuFacts((facts) => ({ ...facts, viewIds })); }).catch(() => undefined);
   }, [corral]);
 
   const inFolderView = corral.selection.view === 'folder';
@@ -170,12 +176,12 @@ export function App() {
     const { hostTotal, viewIds } = menuFacts;
     const viewCount = viewIds?.length ?? null;
     const items: MenuItem[] = [
-      { kind: 'item', label: many ? `Open ${countLabel(targetIds.length)}` : 'Open', icon: <ExternalLink />, onSelect: () => {
-        void (targetIds.length === 1 ? Promise.resolve([record]) : db.bookmarks.bulkGet(targetIds)).then((rows) => openRecords(rows));
+      { kind: 'item', label: many ? targetIds.length > 15 ? 'Open first 15 bookmarks' : `Open ${countLabel(targetIds.length)}` : 'Open', icon: <ExternalLink />, onSelect: () => {
+        void (targetIds.length === 1 ? Promise.resolve([record]) : db.bookmarks.bulkGet(targetIds.slice(0, 15))).then((rows) => openRecords(rows));
       } },
+      { kind: 'item', label: 'Edit bookmark…', icon: <Pencil />, onSelect: () => setBookmarkEditor({ record }) },
       { kind: 'item', label: 'Copy URL', icon: <Copy />, onSelect: () => {
-        void navigator.clipboard.writeText(record.url);
-        corral.setToast({ message: 'URL copied' });
+        void navigator.clipboard.writeText(record.url).then(() => corral.setToast({ message: 'URL copied' })).catch(() => corral.setToast({ message: 'Clipboard unavailable. Open Edit bookmark to copy the URL.' }));
       } },
       { kind: 'separator' },
       // Site actions. Selecting is the flexible one — the selection bar and
@@ -250,11 +256,21 @@ export function App() {
       ? `${countLabel(corral.viewTotal, 'link')} · ${countLabel(corral.folderEntries.length, 'folder')}`
       : countLabel(corral.viewTotal, 'link');
 
+  const folderCount = useMemo(() => {
+    const paths = new Set<string>();
+    for (const { folder } of corral.folders) {
+      const parts = folder.split(FOLDER_SEPARATOR);
+      for (let depth = 1; depth <= parts.length; depth++) paths.add(parts.slice(0, depth).join(FOLDER_SEPARATOR));
+    }
+    return paths.size;
+  }, [corral.folders]);
+
   const showHostColumn = corral.density !== 'roomy';
 
   return (
-    <div className="shell" data-busy={corral.busy || undefined}>
+    <div className={`shell${sidebarOpen ? ' sidebar-open' : ''}`} data-busy={corral.busy || undefined}>
       <header className="topbar">
+        <button className="icon-button sidebar-toggle" aria-label="Toggle folders" aria-expanded={sidebarOpen} aria-controls="folder-sidebar" onClick={() => setSidebarOpen(!sidebarOpen)}><Menu /></button>
         <div className="logo" aria-label="Corral">
           <Lasso aria-hidden="true" />
           <span>CORR<em>AL</em></span>
@@ -263,6 +279,7 @@ export function App() {
         <label className="search">
           <Search className="search-icon" />
           <input
+            aria-label="Search bookmarks"
             ref={searchRef}
             value={corral.query}
             onChange={(event) => corral.setQuery(event.target.value)}
@@ -285,31 +302,33 @@ export function App() {
 
         <div className="topbar-stats" aria-label="Library">
           <div className="stat-chip"><strong>{corral.stats.total.toLocaleString()}</strong> BOOKMARKS</div>
-          <div className="stat-chip"><strong>{corral.folders.length.toLocaleString()}</strong> FOLDERS</div>
+          <div className="stat-chip"><strong>{folderCount.toLocaleString()}</strong> FOLDERS</div>
           <div className="stat-chip"><strong>{formatBytes(corral.storageUsage)}</strong> ON DEVICE</div>
         </div>
 
         <div className="topbar-btns">
+          <button className="tbtn primary" aria-label="Add bookmark" title="Add bookmark" disabled={corral.busy} onClick={() => setBookmarkEditor({})}><Plus /><span className="tbtn-text">Add</span></button>
           <button
             className="tbtn"
             title="Remove duplicate links"
+            aria-label="Find duplicates"
             disabled={corral.busy || corral.stats.total === 0}
             onClick={() => void runDedup()}
           >
             <CopyMinus /> <span className="tbtn-text">Find dups</span>
           </button>
-          <button className="tbtn" title="Export" onClick={() => setExportOpen(true)}><Download /> <span className="tbtn-text">Export</span></button>
-          <button className="tbtn primary" onClick={() => setImportOpen(true)}><Plus /> <span className="tbtn-text">Import</span></button>
+          <button className="tbtn" title="Export" aria-label="Export bookmarks" onClick={() => setExportOpen(true)}><Download /> <span className="tbtn-text">Export</span></button>
+          <button className="tbtn" aria-label="Import bookmarks" title="Import bookmarks" onClick={() => setImportOpen(true)}><Upload /> <span className="tbtn-text">Import</span></button>
         </div>
       </header>
 
       <div className="main">
-        <aside className="sidebar">
+        <aside className="sidebar" id="folder-sidebar">
           <FolderTree
             folders={corral.folders}
             total={corral.stats.total}
             selection={corral.selection}
-            onSelect={corral.chooseView}
+            onSelect={(view) => { corral.chooseView(view); setSidebarOpen(false); }}
             drag={drag}
             onNewFolder={() => setNameIntent({ kind: 'create', parent: '' })}
             onFolderContextMenu={onFolderContextMenu}
@@ -319,13 +338,20 @@ export function App() {
             <StatusLine corral={corral} />
             <FaviconLine corral={corral} />
             <div className="side-meta">
-              <span>IndexedDB</span>
+              <span>Saved on this device</span>
               <span>Local only</span>
             </div>
           </div>
         </aside>
 
+        {sidebarOpen && <button className="sidebar-scrim" aria-label="Close folders" onClick={() => setSidebarOpen(false)} />}
         <section className={`content density-${corral.density}`}>
+          {inFolderView && <nav className="breadcrumbs" aria-label="Folder path">
+            <button onClick={() => corral.chooseView({ view: 'all', folder: '' })}>All bookmarks</button>
+            {corral.selection.folder.split(FOLDER_SEPARATOR).map((part, index, parts) => <span key={index}>
+              <span aria-hidden="true"> / </span><button aria-current={index === parts.length - 1 ? 'page' : undefined} onClick={() => corral.chooseView({ view: 'folder', folder: parts.slice(0, index + 1).join(FOLDER_SEPARATOR) })}>{part}</button>
+            </span>)}
+          </nav>}
           <div className="toolbar">
             <div className="view-title">
               <h1 title={heading}>{heading}</h1>
@@ -359,7 +385,7 @@ export function App() {
           <div className={`bulk-bar${selectedCount === 0 ? ' empty' : ''}`} role="region" aria-label="Selection">
             <span className="sel-count">{selectedCount.toLocaleString()} selected</span>
             {selectedCount === 0 ? (
-              <button className="tbtn ghost sm" disabled={corral.itemCount === 0} title="Select every row in this list (⌘A)" onClick={() => void corral.selectAllRows()}>
+              <button className="tbtn ghost sm" disabled={(corral.isSearching ? corral.search.ids.length : corral.viewTotal) === 0} title="Select every row in this list (⌘A)" onClick={() => void corral.selectAllRows()}>
                 <CheckSquare /> Select all
               </button>
             ) : corral.baseUrlSelectionPending ? (
@@ -389,7 +415,7 @@ export function App() {
             <span className="col acts" />
           </div>
 
-          <BookmarkList corral={corral} onRowPointerDown={onRowPointerDown} onRowContextMenu={onRowContextMenu} onImport={() => setImportOpen(true)} />
+          <BookmarkList corral={corral} onRowPointerDown={onRowPointerDown} onRowContextMenu={onRowContextMenu} onImport={() => setImportOpen(true)} onEdit={(record) => setBookmarkEditor({ record })} />
         </section>
       </div>
 
@@ -439,10 +465,14 @@ export function App() {
         />
       )}
 
+      {bookmarkEditor && <BookmarkDialog record={bookmarkEditor.record} folder={corral.selection.folder} folders={corral.folders} onSave={corral.saveBookmark} onClose={() => setBookmarkEditor(null)} />}
+      {corral.deletionRequest && <ConfirmDialog title="Remove a large selection" body={`${countLabel(corral.deletionRequest.length)} will be removed. Undo is available for up to 50,000 bookmarks; this selection exceeds that limit. Export a backup first if you need to recover these links.`} confirmLabel="Remove bookmarks" danger onConfirm={() => void corral.deleteIds(corral.deletionRequest!, true)} onClose={() => corral.setDeletionRequest(null)} />}
+
       {dedupIds && (
         <ConfirmDialog
           title="Remove duplicate links"
-          body={`${countLabel(dedupIds.length)} share${dedupIds.length === 1 ? 's' : ''} a URL with an older copy. Remove ${dedupIds.length === 1 ? 'it' : 'them'}? The oldest copy of each link stays, and Undo will be offered.`}
+            aria-label="Find duplicates"
+          body={`${countLabel(dedupIds.length)} share${dedupIds.length === 1 ? 's' : ''} a URL with an older copy. Remove ${dedupIds.length === 1 ? 'it' : 'them'}? The oldest copy of each link stays, ${dedupIds.length <= 50_000 ? 'Undo will be offered.' : 'This exceeds the Undo limit; another confirmation will be required.'}`}
           confirmLabel={`Remove ${countLabel(dedupIds.length)}`}
           danger
           onConfirm={() => void corral.deleteIds(dedupIds)}

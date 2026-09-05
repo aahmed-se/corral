@@ -4,6 +4,7 @@ import type { BookmarkRecord, BookmarkSource } from './db.ts';
  * is deliberately deferred to the worker — it is the expensive part. */
 export type RawBookmarkInput = {
   chromeId?: string;
+  importedAt?: number;
   title: string;
   url: string;
   folder: string;
@@ -56,29 +57,55 @@ export function downloadBlob(filename: string, blob: Blob) {
   window.setTimeout(() => URL.revokeObjectURL(url), 1_000);
 }
 
-/** Builds a Netscape bookmark file as string parts, so a 500k-record export
- * becomes a multi-part Blob instead of one giant string. */
-export function toNetscapeHtmlParts(records: BookmarkRecord[]) {
+export const NETSCAPE_HEADER = '<!DOCTYPE NETSCAPE-Bookmark-file-1>\n<META HTTP-EQUIV="Content-Type" CONTENT="text/html; charset=UTF-8">\n<TITLE>Corral Bookmarks</TITLE>\n<H1>Corral Bookmarks</H1>\n<DL><p>\n';
+export const NETSCAPE_CLOSE = '</DL><p>\n';
+export const htmlFolderOpen = (name: string) => `<DT><H3>${escapeHtml(name)}</H3>\n<DL><p>\n`;
+export const htmlBookmark = (item: BookmarkRecord) => `<DT><A HREF="${escapeHtml(item.url)}" ADD_DATE="${Math.floor(item.dateAdded / 1000)}">${escapeHtml(item.title)}</A>\n`;
+
+/** Iterative traversal preserves real nested folders, including empty ones. */
+export function* folderExportSteps(paths: string[]): Generator<{ kind: 'open'; name: string; path: string } | { kind: 'close' }> {
+  const all = new Set<string>();
+  for (const path of paths) {
+    const segments = path.split(' / ');
+    for (let depth = 1; depth <= segments.length; depth++) all.add(segments.slice(0, depth).join(' / '));
+  }
+  const children = new Map<string, string[]>();
+  for (const path of all) {
+    const cut = path.lastIndexOf(' / ');
+    const parent = cut < 0 ? '' : path.slice(0, cut);
+    const list = children.get(parent) ?? [];
+    list.push(path);
+    children.set(parent, list);
+  }
+  for (const list of children.values()) list.sort((a, b) => a.localeCompare(b));
+  const stack: Array<string | null> = (children.get('') ?? []).slice().reverse();
+  while (stack.length) {
+    const path = stack.pop();
+    if (path === null) { yield { kind: 'close' }; continue; }
+    if (path === undefined) continue;
+    yield { kind: 'open', path, name: path.split(' / ').at(-1)! };
+    stack.push(null);
+    const descendants = children.get(path) ?? [];
+    for (let index = descendants.length - 1; index >= 0; index--) stack.push(descendants[index]!);
+  }
+}
+
+export function toNetscapeHtmlParts(records: BookmarkRecord[], emptyFolders: string[] = []) {
   const byFolder = new Map<string, BookmarkRecord[]>();
   for (const record of records) {
     const group = byFolder.get(record.folder) ?? [];
     group.push(record);
     byFolder.set(record.folder, group);
   }
-  const parts: string[] = [
-    '<!DOCTYPE NETSCAPE-Bookmark-file-1>\n<META HTTP-EQUIV="Content-Type" CONTENT="text/html; charset=UTF-8">\n<TITLE>Sift Bookmarks</TITLE>\n<H1>Sift Bookmarks</H1>\n<DL><p>\n',
-  ];
-  const folders = Array.from(byFolder.keys()).sort((left, right) => left.localeCompare(right));
-  for (const folder of folders) {
-    const items = byFolder.get(folder)!;
-    const links: string[] = [`    <DT><H3>${escapeHtml(folder)}</H3>\n    <DL><p>\n`];
-    for (const item of items) {
-      links.push(`        <DT><A HREF="${escapeHtml(item.url)}" ADD_DATE="${Math.floor(item.dateAdded / 1000)}">${escapeHtml(item.title)}</A>\n`);
+  const parts = [NETSCAPE_HEADER];
+  for (const step of folderExportSteps([...byFolder.keys(), ...emptyFolders])) {
+    if (step.kind === 'close') parts.push(NETSCAPE_CLOSE);
+    else {
+      parts.push(htmlFolderOpen(step.name));
+      parts.push((byFolder.get(step.path) ?? []).map(htmlBookmark).join(''));
     }
-    links.push('    </DL><p>\n');
-    parts.push(links.join(''));
   }
-  parts.push('</DL><p>\n');
+  parts.push(NETSCAPE_CLOSE);
   return parts;
 }
 
@@ -110,7 +137,7 @@ function readAttributes(attrs: string) {
  * tokenizer — DOMParser is unavailable in workers, and building a DOM for a
  * 100MB export froze the page anyway. Tracks the <H3>/<DL> folder structure
  * and tolerates the omitted closing tags these files traditionally have. */
-export function parseNetscapeHtml(text: string): RawBookmarkInput[] {
+export function parseNetscapeHtml(text: string, folderPaths?: string[]): RawBookmarkInput[] {
   const records: RawBookmarkInput[] = [];
   const folderStack: string[] = [];
   let pendingFolder: string | null = null;
@@ -124,6 +151,7 @@ export function parseNetscapeHtml(text: string): RawBookmarkInput[] {
         if (folderStack.length > 0) folderStack.pop();
       } else {
         folderStack.push(pendingFolder ?? '');
+        if (pendingFolder) folderPaths?.push(folderStack.filter(Boolean).join(' / '));
         pendingFolder = null;
       }
       continue;
@@ -164,7 +192,7 @@ export function parseNetscapeHtml(text: string): RawBookmarkInput[] {
   return records;
 }
 
-export function parseBookmarkJson(text: string): RawBookmarkInput[] {
+export function parseBookmarkArchive(text: string): { records: RawBookmarkInput[]; folders: string[] } {
   const parsed = JSON.parse(text) as unknown;
   const candidate = Array.isArray(parsed)
     ? parsed
@@ -172,9 +200,9 @@ export function parseBookmarkJson(text: string): RawBookmarkInput[] {
       ? (parsed as { records: unknown }).records
       : typeof parsed === 'object' && parsed !== null && 'bookmarks' in parsed
         ? (parsed as { bookmarks: unknown }).bookmarks
-        : [];
+        : null;
   if (!Array.isArray(candidate)) throw new Error('This JSON file does not contain a bookmark list.');
-  return candidate.flatMap((value) => {
+  const records: RawBookmarkInput[] = candidate.flatMap((value) => {
     if (typeof value !== 'object' || value === null || !('url' in value) || typeof value.url !== 'string') return [];
     const item = value as Partial<BookmarkRecord> & { url: string };
     return [{
@@ -183,9 +211,18 @@ export function parseBookmarkJson(text: string): RawBookmarkInput[] {
       folder: typeof item.folder === 'string' ? item.folder : 'Imported',
       dateAdded: typeof item.dateAdded === 'number' ? item.dateAdded : Date.now(),
       source: 'json' as const,
+      importedAt: typeof item.importedAt === 'number' ? item.importedAt : undefined,
       chromeId: typeof item.chromeId === 'string' ? item.chromeId : undefined,
     }];
   });
+  const folders = typeof parsed === 'object' && parsed !== null && 'folders' in parsed && Array.isArray(parsed.folders)
+    ? parsed.folders.filter((path): path is string => typeof path === 'string' && Boolean(path.trim()))
+    : [];
+  return { records, folders };
+}
+
+export function parseBookmarkJson(text: string) {
+  return parseBookmarkArchive(text).records;
 }
 
 /** Flattens an already-fetched Chrome tree into raw inputs. Cheap enough for

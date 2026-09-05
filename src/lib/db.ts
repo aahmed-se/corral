@@ -2,7 +2,7 @@ import Dexie, { type EntityTable, type Table } from 'dexie';
 import { yieldToQueue } from './task-queue.ts';
 import type { PersistedViewData } from './view-index.ts';
 
-export type BookmarkSource = 'chrome' | 'html' | 'json';
+export type BookmarkSource = 'chrome' | 'html' | 'json' | 'manual';
 export type SortMode = 'newest' | 'oldest' | 'title' | 'site';
 export type ViewKind = 'all' | 'folder';
 
@@ -178,7 +178,7 @@ export function sanitizeName(value: string) {
 export const UNFILED = 'Unsorted';
 
 export function makeRecord(
-  input: Pick<BookmarkRecord, 'title' | 'url' | 'folder' | 'dateAdded' | 'source'> & { chromeId?: string },
+  input: Pick<BookmarkRecord, 'title' | 'url' | 'folder' | 'dateAdded' | 'source'> & { chromeId?: string; importedAt?: number },
 ): BookmarkRecord {
   return {
     ...input,
@@ -186,7 +186,8 @@ export function makeRecord(
     folder: sanitizeName(input.folder) || UNFILED,
     normalizedUrl: normalizeUrl(input.url),
     host: getBaseHost(input.url),
-    importedAt: Date.now(),
+    dateAdded: Number.isFinite(input.dateAdded) && input.dateAdded >= 0 ? input.dateAdded : Date.now(),
+    importedAt: typeof input.importedAt === 'number' && Number.isFinite(input.importedAt) && input.importedAt >= 0 ? input.importedAt : Date.now(),
   };
 }
 

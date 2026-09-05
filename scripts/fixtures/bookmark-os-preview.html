@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Bookmark OS · Test fixture</title><link rel="stylesheet" href="/bookmark-os/app.css"></head><body>
+<script type="module">
+// Development-only fixture: every Chrome API operates on disposable memory.
+// Open through Vite at /scripts/fixtures/bookmark-os-preview.html.
+const html = await fetch('/bookmark-os/app.html').then(response => response.text());
+const parsed = new DOMParser().parseFromString(html, 'text/html');
+parsed.querySelectorAll('script').forEach(script => script.remove());
+document.body.append(...parsed.body.childNodes);
+document.querySelector('.sidebar-note').textContent = 'Test fixture · no real Chrome data';
+const rows = Array.from({ length: 75 }, (_, i) => ({ id: String(i + 10), title: `Research bookmark ${i + 1}`, url: `https://example.com/paper/${i}`, parentId: '2', index: i, dateAdded: 1700000000000 + i * 1000 }));
+rows.push({ id: 'protected', title: 'Protected bookmark (simulated failure)', url: 'https://example.org/protected', parentId: '2', index: 75, dateAdded: 1700000000000 });
+rows.push({ ...rows[0], id: 'duplicate', title: 'Duplicate research bookmark', index: 76, dateAdded: 1700000900000 });
+const tree = [{ id: '0', title: '', children: [{ id: '1', parentId: '0', title: 'Bookmarks bar', children: [{ id: '2', parentId: '1', title: 'Research', children: rows }, { id: '3', parentId: '1', title: 'Reading', children: [] }] }] }];
+const get = id => { const queue = [...tree]; while (queue.length) { const node = queue.pop(); if (node.id === id) return node; queue.push(...node.children || []); } throw new Error('Bookmark no longer exists'); };
+const remove = id => { if (id === 'protected') throw new Error('This bookmark is managed by your organization'); const node = get(id); const parent = get(node.parentId); parent.children = parent.children.filter(child => child.id !== id); return node; };
+let serial = 1000;
+globalThis.chrome = { bookmarks: {
+  getTree: async () => structuredClone(tree),
+  create: async properties => { const parent = get(properties.parentId); const node = { ...properties, id: String(serial++), dateAdded: Date.now() }; if (!node.url) node.children = []; parent.children.splice(properties.index ?? parent.children.length, 0, node); return structuredClone(node); },
+  remove: async id => { remove(id); },
+  move: async (id, properties) => { const node = remove(id); Object.assign(node, properties); const parent = get(properties.parentId); parent.children.splice(properties.index ?? parent.children.length, 0, node); return structuredClone(node); },
+  update: async (id, properties) => Object.assign(get(id), properties),
+}, tabs: { create: async () => {} } };
+await import('/bookmark-os/app.js');
+</script></body></html>

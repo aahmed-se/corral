@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef, type CSSProperties, type PointerEvent as ReactPointerEvent } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
-import { CheckSquare, ChevronRight, ExternalLink, Folder, FolderOpen, SearchX, Square, Trash2 } from 'lucide-react';
+import { CheckSquare, ChevronRight, ExternalLink, Folder, FolderOpen, Pencil, SearchX, Square, Trash2 } from 'lucide-react';
 import { openableBookmarkUrl } from '../lib/bookmark-url.ts';
 import { db, type BookmarkRecord } from '../lib/db.ts';
 import { countLabel, PAGE_SIZE, type Corral, type Density } from './use-corral.ts';
@@ -69,11 +69,12 @@ function SiteMark({ host }: { host: string }) {
   );
 }
 
-export function BookmarkList({ corral, onRowPointerDown, onRowContextMenu, onImport }: {
+export function BookmarkList({ corral, onRowPointerDown, onRowContextMenu, onImport, onEdit }: {
   corral: Corral;
   onRowPointerDown: (event: ReactPointerEvent, record: BookmarkRecord) => void;
   onRowContextMenu: (event: React.MouseEvent, record: BookmarkRecord, rowIndex: number) => void;
   onImport: () => void;
+  onEdit: (record: BookmarkRecord) => void;
 }) {
   const { itemCount, isSearching, recordAt, selected, density, listVersion, loadPage } = corral;
   const folderEntries = isSearching ? [] : corral.folderEntries;
@@ -228,10 +229,8 @@ export function BookmarkList({ corral, onRowPointerDown, onRowContextMenu, onImp
                   <span className="row-title">{folder.name}</span>
                   {density === 'roomy' && <span className="row-url">{folder.path}</span>}
                 </span>
-                {showHost && <span aria-hidden="true" />}
                 <span className="folder-count">{countLabel(folder.total, 'link')}</span>
                 <ChevronRight className="folder-chevron" aria-hidden="true" />
-                <span aria-hidden="true" />
               </div>
             );
           }
@@ -275,6 +274,8 @@ export function BookmarkList({ corral, onRowPointerDown, onRowContextMenu, onImp
               onDoubleClick={() => openRecord(record)}
               onContextMenu={(event) => onRowContextMenu(event, record, bookmarkIndex)}
               onKeyDown={(event) => {
+                if (event.target !== event.currentTarget) return;
+                if (event.key === 'F2') { event.preventDefault(); onEdit(record); }
                 if (event.key === 'Enter') openRecord(record);
                 if (event.key === ' ') {
                   event.preventDefault();
@@ -318,6 +319,7 @@ export function BookmarkList({ corral, onRowPointerDown, onRowContextMenu, onImp
               </button>
               <time className="row-date">{formatDate(record.dateAdded)}</time>
               <span className="row-actions">
+                <button className="action-btn" aria-label={`Edit ${record.title}`} title="Edit bookmark (F2)" onClick={(event) => { event.stopPropagation(); onEdit(record); }}><Pencil /></button>
                 <button
                   className="action-btn remove"
                   title="Remove bookmark"
